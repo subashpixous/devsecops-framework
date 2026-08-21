@@ -1,0 +1,43 @@
+# Universal DevSecOps Framework - default security policy
+#
+# This file is DATA. It contains no project-specific logic and no project names.
+# A project may supply an override file (policy_path input); it is deep-merged
+# over this file, so omitting a key inherits the default rather than disabling it.
+
+schema_version: 1
+name: default
+
+# Which phase of the roadmap is live. Categories with a higher phase resolve to
+# NOT_IMPLEMENTED and are printed in every report -- they never disappear.
+active_phase: 1
+
+# Controls that MUST execute successfully for a PASS verdict. If any of these is
+# missing, failed, partial or untested, SECURITY resolves to NOT_VERIFIED.
+required_categories:
+  - sast_sonarqube
+
+# Which normalised finding categories count as security-relevant when evaluating
+# thresholds. Bugs and code smells are still collected and reported, but they do
+# not by themselves fail a SECURITY verdict.
+security_finding_categories:
+  - vulnerability
+  - security_hotspot
+
+# Maximum number of OPEN security-relevant findings permitted per canonical
+# severity. -1 means unlimited. UNKNOWN fails closed at 0: an unclassifiable
+# finding is never treated as harmless.
+severity_thresholds:
+  CRITICAL: 0
+  HIGH: 0
+  UNKNOWN: 0
+  MEDIUM: -1
+  LOW: -1
+  INFO: -1
+
+# An explicitly failed upstream quality gate is an explicit security failure.
+fail_on_quality_gate_error: true
+
+# Security hotspots are "requires review", not confirmed vulnerabilities. They are
+# always collected and always reported; set true to also count them against the
+# severity thresholds.
+hotspots_count_toward_thresholds: false

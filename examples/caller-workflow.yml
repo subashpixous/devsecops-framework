@@ -1,0 +1,40 @@
+# Example thin caller. Copy into any project as .github/workflows/security.yml
+#
+# This is the ENTIRE per-project integration. Everything else lives in the
+# framework, so onboarding a Flutter, React, Java, Python, PHP or .NET project
+# means copying this file and changing the labels -- never the security logic.
+#
+# It runs alongside the project's existing build/deploy workflow and has no
+# dependency on it in either direction.
+
+name: Security Validation
+
+on:
+  workflow_dispatch:
+  # Enable these once the first manual run has been reviewed:
+  # push:
+  #   branches: [main]
+  # pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    # Pin to a SHA in production. A tag is mutable; a SHA is not, and repinning
+    # the previous SHA is the rollback path for a bad framework release.
+    uses: subashpixous/devsecops-framework/.github/workflows/security-pipeline.yml@v0.1.0
+    with:
+      environment: production
+
+      # Supply these only when they are actually known. Anything left empty is
+      # reported as NOT_ESTABLISHED rather than guessed.
+      deployment_target: ""
+      deployed_url: ""
+
+      # Phase 1 observes and reports. It does not block delivery.
+      active_phase: 1
+      fail_on_security: false
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}

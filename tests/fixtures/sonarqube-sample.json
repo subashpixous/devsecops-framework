@@ -1,0 +1,140 @@
+{
+  "_comment": "SYNTHETIC fixture for unit tests. Not captured from any real SonarQube server and not derived from any real project. Contains no credentials.",
+  "collector": "sonarqube",
+  "read_only": true,
+  "project_key": "example-project",
+  "branch_requested": "main",
+  "branch_scope": "project default branch",
+  "server_version": "25.1.0.0000",
+  "quality_gate": {
+    "projectStatus": {
+      "status": "ERROR",
+      "conditions": [
+        {
+          "status": "ERROR",
+          "metricKey": "new_security_rating",
+          "comparator": "GT",
+          "errorThreshold": "1",
+          "actualValue": "4"
+        },
+        {
+          "status": "OK",
+          "metricKey": "new_reliability_rating",
+          "comparator": "GT",
+          "errorThreshold": "1",
+          "actualValue": "1"
+        }
+      ]
+    }
+  },
+  "issues": [
+    {
+      "key": "AY-vuln-1",
+      "rule": "typescript:S2068",
+      "severity": "BLOCKER",
+      "component": "example-project:UI/src/app/services/auth.service.ts",
+      "project": "example-project",
+      "line": 42,
+      "hash": "6a1f2b3c",
+      "textRange": { "startLine": 42, "endLine": 42 },
+      "status": "OPEN",
+      "message": "Review this potentially hard-coded credential.",
+      "effort": "15min",
+      "tags": ["cwe", "owasp-a7"],
+      "creationDate": "2026-05-04T10:11:12+0000",
+      "updateDate": "2026-07-01T08:00:00+0000",
+      "type": "VULNERABILITY"
+    },
+    {
+      "key": "AY-impact-1",
+      "rule": "typescript:S5122",
+      "severity": "MINOR",
+      "component": "example-project:UI/src/app/core/cors.ts",
+      "project": "example-project",
+      "line": 8,
+      "status": "OPEN",
+      "message": "Make sure that enabling CORS is safe here.",
+      "impacts": [
+        { "softwareQuality": "SECURITY", "severity": "HIGH" },
+        { "softwareQuality": "MAINTAINABILITY", "severity": "LOW" }
+      ],
+      "tags": [],
+      "creationDate": "2026-06-01T09:00:00+0000",
+      "updateDate": "2026-06-01T09:00:00+0000",
+      "type": "VULNERABILITY"
+    },
+    {
+      "key": "AY-bug-1",
+      "rule": "typescript:S2259",
+      "severity": "MAJOR",
+      "component": "example-project:UI/src/app/pages/list.component.ts",
+      "project": "example-project",
+      "line": 130,
+      "status": "OPEN",
+      "message": "Refactor this code to not dereference a possibly null value.",
+      "tags": ["cert"],
+      "creationDate": "2026-03-15T12:00:00+0000",
+      "updateDate": "2026-03-15T12:00:00+0000",
+      "type": "BUG"
+    },
+    {
+      "key": "AY-smell-1",
+      "rule": "typescript:S1481",
+      "severity": "MINOR",
+      "component": "example-project:UI/src/app/pages/list.component.ts",
+      "project": "example-project",
+      "line": 22,
+      "status": "OPEN",
+      "message": "Remove the declaration of the unused 'temp' variable.",
+      "tags": ["unused"],
+      "creationDate": "2026-03-15T12:00:00+0000",
+      "updateDate": "2026-03-15T12:00:00+0000",
+      "type": "CODE_SMELL"
+    }
+  ],
+  "hotspots": [
+    {
+      "key": "AY-hotspot-1",
+      "component": "example-project:API/Program.cs",
+      "project": "example-project",
+      "securityCategory": "insecure-conf",
+      "vulnerabilityProbability": "HIGH",
+      "status": "TO_REVIEW",
+      "line": 274,
+      "message": "Make sure that this debug feature is deactivated before delivering the code in production.",
+      "ruleKey": "csharpsquid:S4507",
+      "creationDate": "2026-04-02T11:00:00+0000",
+      "updateDate": "2026-04-02T11:00:00+0000"
+    },
+    {
+      "key": "AY-hotspot-2",
+      "component": "example-project:API/Startup.cs",
+      "project": "example-project",
+      "securityCategory": "weak-cryptography",
+      "vulnerabilityProbability": "LOW",
+      "status": "REVIEWED",
+      "resolution": "SAFE",
+      "line": 51,
+      "message": "Make sure this weak hash algorithm is not used in a sensitive context.",
+      "ruleKey": "csharpsquid:S4790",
+      "creationDate": "2026-04-02T11:00:00+0000",
+      "updateDate": "2026-04-10T11:00:00+0000"
+    }
+  ],
+  "rules": {
+    "typescript:S2068": {
+      "securityStandards": ["cwe:798", "owaspTop10-2021:a7", "owaspTop10:a2"],
+      "name": "Hard-coded credentials are security-sensitive",
+      "type": "VULNERABILITY",
+      "remediation": "15min",
+      "htmlDesc": ""
+    },
+    "typescript:S5122": {
+      "securityStandards": ["cwe:942", "owaspTop10-2021:a5"],
+      "name": "Having a permissive Cross-Origin Resource Sharing policy is security-sensitive",
+      "type": "VULNERABILITY",
+      "remediation": "10min",
+      "htmlDesc": ""
+    }
+  }
+}

@@ -1,0 +1,74 @@
+# The framework's own CI.
+#
+# A security framework that is not itself tested cannot be trusted to report on
+# anything else. The invariant suite in tests/ must pass before any tag is cut:
+# it is what guarantees a scanner failure can never become SECURITY = PASS.
+
+name: Framework self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Invariants (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run invariant tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Verify the collector is read-only
+        run: |
+          set -euo pipefail
+          echo "Asserting no mutating HTTP verb exists anywhere in the collectors."
+          if grep -rnE '"(POST|PUT|PATCH|DELETE)"|method="(POST|PUT|PATCH|DELETE)"' framework/collectors/; then
+            echo "::error::A mutating HTTP method was found in a collector. Collectors must be read-only."
+            exit 1
+          fi
+          echo "OK: collectors issue GET only."
+
+      - name: Verify no hard-coded project identifiers
+        run: |
+          set -euo pipefail
+          echo "Asserting the framework contains no project-specific logic."
+          if grep -rniE 'dashboard-v2v|oneportal' framework/ ; then
+            echo "::error::A project-specific identifier leaked into the framework."
+            exit 1
+          fi
+          echo "OK: framework is project-agnostic."
+
+      - name: Smoke test the full pipeline on a synthetic payload
+        run: |
+          set -euo pipefail
+          python -m framework.cli run \
+            --workspace . \
+            --output /tmp/security-results \
+            --sonar-payload tests/fixtures/sonarqube-sample.json \
+            --environment ci
+          test -f /tmp/security-results/final-report.json
+          test -f /tmp/security-results/report.md
+          test -f /tmp/security-results/security-report.pdf
+          echo "OK: JSON, Markdown and PDF all produced."

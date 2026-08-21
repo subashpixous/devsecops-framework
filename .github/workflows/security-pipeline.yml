@@ -1,0 +1,208 @@
+# Universal Production DevSecOps Security Validation Framework
+# Reusable security pipeline -- the ONLY public entrypoint of this framework.
+#
+# Callers stay thin:
+#
+#   jobs:
+#     security:
+#       uses: <owner>/devsecops-framework/.github/workflows/security-pipeline.yml@<sha>
+#       secrets:
+#         SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+#         SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+#
+# This workflow NEVER builds, deploys, or modifies the calling project. It reads
+# the repository, reads the analysis server, and writes reports to an artifact.
+
+name: Security Pipeline (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        description: "Override the detected project name."
+        type: string
+        default: ""
+      environment:
+        description: "Environment label (production, qa, ...). Left NOT_ESTABLISHED if empty."
+        type: string
+        default: ""
+      deployment_target:
+        description: "Deployment target. Left NOT_ESTABLISHED if empty."
+        type: string
+        default: ""
+      deployed_url:
+        description: "Live URL for future runtime testing. Left NOT_ESTABLISHED if empty."
+        type: string
+        default: ""
+      sonar_project_key:
+        description: "Override SonarQube project key resolution."
+        type: string
+        default: ""
+      policy_path:
+        description: "Path (inside the calling repo) to a policy override file."
+        type: string
+        default: ""
+      build_status:
+        description: "Build result reported by the caller (pass/fail). Never inferred."
+        type: string
+        default: ""
+      deployment_status:
+        description: "Deployment result reported by the caller (deployed/failed/skipped). Never inferred."
+        type: string
+        default: ""
+      active_phase:
+        description: "Roadmap phase to execute. Phase 1 = SonarQube only."
+        type: number
+        default: 1
+      fail_on_security:
+        description: "Fail the job when SECURITY is not PASS. Default false: observe, do not block."
+        type: boolean
+        default: false
+      framework_repository:
+        description: "Framework repo to check out. Change only when running from a fork."
+        type: string
+        default: "subashpixous/devsecops-framework"
+      framework_ref:
+        description: "Fallback framework ref if the job workflow SHA is unavailable."
+        type: string
+        default: "main"
+      artifact_name:
+        type: string
+        default: "security-results"
+      artifact_retention_days:
+        type: number
+        default: 30
+      python_version:
+        type: string
+        default: "3.11"
+    secrets:
+      SONAR_TOKEN:
+        description: "Existing SonarQube token. Used read-only; never rotated or logged."
+        required: true
+      SONAR_HOST_URL:
+        description: "Existing SonarQube host URL."
+        required: true
+    outputs:
+      security_status:
+        description: "PASS | FAILED | NOT_VERIFIED"
+        value: ${{ jobs.security.outputs.security_status }}
+      runtime_security_status:
+        description: "PASS | FAILED | NOT_TESTED"
+        value: ${{ jobs.security.outputs.runtime_security_status }}
+      build_status:
+        value: ${{ jobs.security.outputs.build_status }}
+      deployment_status:
+        value: ${{ jobs.security.outputs.deployment_status }}
+      open_findings:
+        value: ${{ jobs.security.outputs.open_findings }}
+      coverage_complete:
+        description: "false whenever any applicable category was not tested."
+        value: ${{ jobs.security.outputs.coverage_complete }}
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    name: Security validation
+    runs-on: ubuntu-latest
+    # Least privilege: read the code, write nothing.
+    permissions:
+      contents: read
+    outputs:
+      security_status: ${{ steps.run.outputs.security_status }}
+      runtime_security_status: ${{ steps.run.outputs.runtime_security_status }}
+      build_status: ${{ steps.run.outputs.build_status }}
+      deployment_status: ${{ steps.run.outputs.deployment_status }}
+      open_findings: ${{ steps.run.outputs.open_findings }}
+      coverage_complete: ${{ steps.run.outputs.coverage_complete }}
+
+    steps:
+      # NOTE: actions below are referenced by version tag. They are NOT SHA-pinned
+      # yet -- see docs/ARCHITECTURE.md "Supply chain" for the pinning procedure.
+      # Pin before treating this workflow as production-hardened.
+      - name: Checkout project under analysis
+        uses: actions/checkout@v4
+        with:
+          path: project
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout security framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.framework_repository }}
+          # job_workflow_sha pins the framework to exactly the commit that defines
+          # this reusable workflow, so code and workflow can never drift apart.
+          ref: ${{ github.job_workflow_sha || inputs.framework_ref }}
+          path: framework
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install framework dependencies
+        working-directory: framework
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Framework self-test
+        working-directory: framework
+        run: |
+          echo "Verifying framework invariants before trusting any verdict it produces."
+          python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Run security validation
+        id: run
+        working-directory: framework
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          # Inputs are passed through the environment rather than interpolated into
+          # the shell, so a hostile input value cannot become a shell command.
+          IN_PROJECT_NAME: ${{ inputs.project_name }}
+          IN_ENVIRONMENT: ${{ inputs.environment }}
+          IN_DEPLOYMENT_TARGET: ${{ inputs.deployment_target }}
+          IN_DEPLOYED_URL: ${{ inputs.deployed_url }}
+          IN_SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
+          IN_BUILD_STATUS: ${{ inputs.build_status }}
+          IN_DEPLOYMENT_STATUS: ${{ inputs.deployment_status }}
+          IN_ACTIVE_PHASE: ${{ inputs.active_phase }}
+          IN_POLICY_PATH: ${{ inputs.policy_path }}
+          IN_FAIL_ON_SECURITY: ${{ inputs.fail_on_security }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            --workspace "${GITHUB_WORKSPACE}/project"
+            --output "${GITHUB_WORKSPACE}/security-results"
+            --project-name "${IN_PROJECT_NAME}"
+            --environment "${IN_ENVIRONMENT}"
+            --deployment-target "${IN_DEPLOYMENT_TARGET}"
+            --deployed-url "${IN_DEPLOYED_URL}"
+            --sonar-project-key "${IN_SONAR_PROJECT_KEY}"
+            --build-status "${IN_BUILD_STATUS}"
+            --deployment-status "${IN_DEPLOYMENT_STATUS}"
+            --active-phase "${IN_ACTIVE_PHASE}"
+          )
+          if [ -n "${IN_POLICY_PATH}" ]; then
+            args+=( --policy "${GITHUB_WORKSPACE}/project/${IN_POLICY_PATH}" )
+          fi
+          if [ "${IN_FAIL_ON_SECURITY}" = "true" ]; then
+            args+=( --fail-on-security )
+          fi
+
+          python -m framework.cli run "${args[@]}"
+
+      - name: Upload security results
+        # always(): a failed or blocked run is exactly when the evidence matters most.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: security-results/
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: warn
