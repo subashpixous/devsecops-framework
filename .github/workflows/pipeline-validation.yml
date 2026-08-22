@@ -1,0 +1,50 @@
+# Reusable-pipeline validation.
+#
+# `security-pipeline.yml` is workflow_call-only, so it cannot be dispatched
+# directly and would otherwise never execute in this repository's own CI. This
+# workflow calls it exactly the way a consuming project does — by full external
+# reference — so the cross-repository resolution path, the scanner installation
+# step and the artifact upload are all exercised for real.
+#
+# The framework repository is itself a valid target: a Python project with a
+# dependency manifest, CI workflows and no container image, so several categories
+# legitimately resolve to NOT_APPLICABLE or NOT_VERIFIED. That is the point — it
+# proves the project-adaptive behaviour on a real runner.
+#
+# No credentials are supplied. SonarQube, 42Crunch, Prowler, IAM Access Analyzer
+# and cosign are expected to report NOT_VERIFIED.
+
+name: Reusable pipeline validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      stages:
+        description: "Stages to execute"
+        type: string
+        default: "PRE_BUILD,POST_BUILD,AGGREGATION,POST_DEPLOY,CLOUD"
+      install_tools:
+        description: "Install the external scanners on the runner"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    # Called by full external reference, pinned to main — the same code path a
+    # real consumer uses.
+    uses: subashpixous/devsecops-framework/.github/workflows/security-pipeline.yml@main
+    with:
+      project_name: devsecops-framework-selfscan
+      environment: ci-validation
+      stages: ${{ inputs.stages }}
+      install_tools: ${{ inputs.install_tools }}
+      # Deliberately empty: no deployed instance, no image, no cloud account.
+      # These categories must report NOT_VERIFIED / NOT_APPLICABLE, never PASS.
+      deployed_url: ""
+      images: ""
+      cloud: ""
+      artifact_name: pipeline-validation-results
+      fail_on_security: false
