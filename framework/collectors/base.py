@@ -38,6 +38,10 @@ class ScannerResult:
     raw_path: str = ""
     payload: Optional[Dict[str, Any]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Set by fail()/partial()/skip(). Once a run has lost coverage, succeed()
+    # must not be able to erase that. The initial status is FAILED (fail closed)
+    # but degraded is False, so the happy path can still promote to OK.
+    degraded: bool = False
 
     @property
     def is_trustworthy(self) -> bool:
@@ -46,24 +50,43 @@ class ScannerResult:
 
     def fail(self, message: str) -> "ScannerResult":
         self.status = SCANNER_FAILED
+        self.degraded = True
         self.errors.append(message)
         return self
 
     def partial(self, message: str) -> "ScannerResult":
-        # A already-failed scan does not get upgraded to partial.
-        if self.status != SCANNER_FAILED:
+        # Do not upgrade an EXPLICITLY failed scan. Explicit failure is signalled
+        # by a recorded error -- not by the status, which starts at FAILED as the
+        # fail-closed default and would otherwise swallow every partial.
+        if not self.errors:
             self.status = SCANNER_PARTIAL
+        self.degraded = True
         self.warnings.append(message)
         return self
 
     def skip(self, message: str) -> "ScannerResult":
         self.status = SCANNER_SKIPPED
+        self.degraded = True
         self.warnings.append(message)
         return self
 
     def succeed(self) -> "ScannerResult":
-        if not self.errors:
+        """Promote to OK -- but never over a degradation already recorded.
+
+        Collectors routinely call partial() for a real loss of coverage and then
+        succeed() at the end of the happy path. partial() only adds a WARNING,
+        never an error, so a plain `if not self.errors` check silently upgraded
+        every partially-degraded scan to fully trusted -- and a category with no
+        coverage could then be asserted PASS.
+        """
+        if not self.errors and not self.degraded:
             self.status = SCANNER_OK
+        return self
+
+    def replay(self) -> "ScannerResult":
+        """Reset degradation for a replayed/injected payload (self-test only)."""
+        self.degraded = False
+        self.errors.clear()
         return self
 
     def finish(self) -> "ScannerResult":
@@ -86,6 +109,7 @@ class ScannerResult:
             "tool": self.tool,
             "category_key": self.category_key,
             "status": self.status,
+            "degraded": self.degraded,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "errors": self.errors,

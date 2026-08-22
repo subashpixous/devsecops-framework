@@ -79,6 +79,55 @@ class ToolRunnerTestCase(unittest.TestCase):
         self.assertIsInstance(tool_available("python"), bool)
 
 
+class ScannerResultStatusTestCase(unittest.TestCase):
+    """succeed() must never erase a degradation already recorded.
+
+    Found by real GitHub runner validation: a Trivy scan that recognised no
+    dependency manifest called partial() and then succeed(). partial() adds only
+    a WARNING, so the old `if not self.errors` check upgraded the result to OK,
+    the category was asserted PASS, and a project with ZERO dependency coverage
+    reported Dependency/SCA = PASS. That is a false pass.
+    """
+
+    def test_partial_then_succeed_stays_partial(self):
+        r = ScannerResult(tool="t", category_key="c")
+        r.payload = {}
+        r.partial("no manifest recognised")
+        r.succeed()
+        self.assertEqual(r.status, "PARTIAL")
+        self.assertFalse(r.is_trustworthy)
+        self.assertTrue(r.degraded)
+
+    def test_skip_then_succeed_stays_skipped(self):
+        r = ScannerResult(tool="t", category_key="c")
+        r.skip("no target supplied")
+        r.succeed()
+        self.assertEqual(r.status, "SKIPPED")
+        self.assertFalse(r.is_trustworthy)
+
+    def test_fail_then_succeed_stays_failed(self):
+        r = ScannerResult(tool="t", category_key="c")
+        r.fail("boom")
+        r.succeed()
+        self.assertEqual(r.status, "FAILED")
+        self.assertFalse(r.is_trustworthy)
+
+    def test_clean_run_still_reaches_ok(self):
+        """The fail-closed default must not block the happy path."""
+        r = ScannerResult(tool="t", category_key="c")
+        self.assertEqual(r.status, "FAILED")   # fail closed before any work
+        r.payload = {}
+        r.succeed()
+        self.assertEqual(r.status, "OK")
+        self.assertTrue(r.is_trustworthy)
+
+    def test_replay_resets_degradation_for_injected_payloads(self):
+        r = ScannerResult(tool="t", category_key="c")
+        r.fail("no credentials")
+        r.replay().succeed()
+        self.assertEqual(r.status, "OK")
+
+
 class SecretPatternTestCase(unittest.TestCase):
     def test_detects_key_without_returning_its_value(self):
         matches = scan_text("var k='%s';" % FAKE_GOOGLE_KEY, "main.js")

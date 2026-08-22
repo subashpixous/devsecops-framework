@@ -207,7 +207,7 @@ def _collect(
                 with open(args.sonar_payload, "r", encoding="utf-8") as handle:
                     result.payload = json.load(handle)
                 result.metadata["payload_source"] = "local file -- NOT a live scan"
-                result.errors.clear()
+                result.replay()
                 result.succeed()
                 result.warnings.append(
                     "Results were loaded from a local payload file rather than a live server. "
