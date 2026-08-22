@@ -217,7 +217,7 @@ jobs:
         if: inputs.install_tools
         continue-on-error: true
         env:
-          TRIVY_VERSION: "0.58.2"
+          TRIVY_VERSION: "0.74.0"
           GITLEAKS_VERSION: "8.23.1"
           NUCLEI_VERSION: "3.3.7"
         run: |
@@ -244,8 +244,8 @@ jobs:
             tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks'
 
           try trivy bash -c '
-            curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh |
-              sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"'
+            curl -sSfL -o /tmp/trivy.tar.gz               "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" &&
+            tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy'
 
           try nuclei bash -c '
             curl -sSfL -o /tmp/nuclei.zip \
