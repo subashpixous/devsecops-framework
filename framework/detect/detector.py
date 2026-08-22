@@ -132,7 +132,13 @@ def _classify_manifest(detection: Detection, root: str, filename: str, relative:
     elif lower == "pubspec.yaml":
         detection.package_managers.add("pub")
         detection.languages.add("dart")
-        detection.frameworks.add("flutter" if "flutter" in _read(path) else "dart")
+        is_flutter = "flutter" in _read(path)
+        detection.frameworks.add("flutter" if is_flutter else "dart")
+        # Flutter targets web as well as mobile. A committed web/ directory means
+        # this project ships a browser bundle, so bundle scanning applies.
+        if is_flutter and os.path.isdir(os.path.join(root, "web")):
+            detection.frontend = True
+            detection.note("framework", "flutter-web (%s)" % relative)
         detection.note("package_manager", relative)
 
     elif lower.endswith(".csproj") or lower.endswith(".vbproj"):

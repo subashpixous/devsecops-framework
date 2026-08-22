@@ -91,7 +91,12 @@ def vulnerability(severity="CRITICAL"):
 
 class StatusEngineTestCase(unittest.TestCase):
     def setUp(self):
+        # These tests exercise the ENGINE, not the shipped policy. Pinning a
+        # narrow policy keeps each assertion about one rule; the shipped default
+        # is covered separately by DefaultPolicyTestCase.
         self.policy = Policy.load()
+        self.policy.required_categories = ["sast_sonarqube"]
+        self.policy.active_phase = 1
         self.engine = StatusEngine(self.policy)
         self.context = RunContext(project_name="p", commit="abc123", branch="main")
 
@@ -278,6 +283,45 @@ class StatusEngineTestCase(unittest.TestCase):
         assessment = self.evaluate([failed_result("token rejected")])
         details = " ".join(i["detail"] for i in assessment.limitations)
         self.assertIn("token rejected", details)
+
+
+class DefaultPolicyTestCase(unittest.TestCase):
+    """The shipped default policy, as configured for production use."""
+
+    def setUp(self):
+        self.policy = Policy.load()
+
+    def test_all_phases_are_active_by_default(self):
+        self.assertEqual(self.policy.active_phase, 6)
+
+    def test_required_categories_cover_the_always_applicable_sast_and_secrets(self):
+        for key in ("sast_sonarqube", "sast_semgrep", "secret_scanning"):
+            self.assertIn(key, self.policy.required_categories)
+
+    def test_every_scanner_finding_category_is_security_relevant(self):
+        for category in ("secret", "dependency_vulnerability", "container_vulnerability",
+                         "misconfiguration", "cloud_misconfiguration", "dast_finding",
+                         "sast_finding", "supply_chain", "tls", "cors"):
+            self.assertTrue(
+                self.policy.is_security_finding_category(category),
+                "%s must count toward the security verdict" % category,
+            )
+
+    def test_severe_thresholds_fail_closed(self):
+        for level in ("CRITICAL", "HIGH", "UNKNOWN"):
+            self.assertEqual(self.policy.threshold_for(level), 0)
+
+    def test_missing_required_scanner_under_default_policy_is_not_verified(self):
+        """With three required categories, one passing scanner is not enough."""
+        engine = StatusEngine(self.policy)
+        assessment = engine.evaluate(
+            context=RunContext(),
+            capabilities=CAPABILITIES,
+            scanner_results=[ok_result()],   # sonarqube only
+            findings=[],
+            quality_gate=GATE_OK,
+        )
+        self.assertEqual(assessment.security_status, SECURITY_NOT_VERIFIED)
 
 
 if __name__ == "__main__":

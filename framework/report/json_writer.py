@@ -22,7 +22,15 @@ from ..core.policy import Policy
 from ..core.schema import Finding, sort_findings, utc_now
 from ..core.status_engine import SecurityAssessment
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+def _lifecycle_counts(findings: List[Finding]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for finding in findings:
+        state = getattr(finding, "lifecycle", "UNKNOWN") or "UNKNOWN"
+        counts[state] = counts.get(state, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def build_report(
@@ -59,6 +67,7 @@ def build_report(
             "runtime_security": assessment.runtime_security_status,
             "verdict_scope": assessment.verdict_scope,
             "coverage_complete": assessment.coverage_complete,
+            "stages_executed": assessment.stages_executed,
             "independence_note": (
                 "BUILD, DEPLOYMENT, SECURITY and RUNTIME_SECURITY are independent. A successful "
                 "deployment does not imply a security pass, and a security failure does not imply a "
@@ -71,9 +80,12 @@ def build_report(
             "threshold_breaches": [b.to_dict() for b in assessment.threshold_breaches],
         },
         "quality_gate": assessment.quality_gate,
+        # FINDING AGGREGATION: new / existing / fixed / suppressed / expired
+        "lifecycle": assessment.lifecycle,
         "findings": {
             "total": len(ordered),
             "open": len(open_findings),
+            "by_lifecycle": _lifecycle_counts(ordered),
             "severity_breakdown": assessment.severity_counts,
             "security_severity_breakdown": assessment.security_severity_counts,
             "items": [f.to_dict() for f in ordered],

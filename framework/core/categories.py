@@ -49,6 +49,23 @@ RUNTIME_PASS = "PASS"
 RUNTIME_FAILED = "FAILED"
 RUNTIME_NOT_TESTED = "NOT_TESTED"
 
+# --- Pipeline stages (approved architecture) ---
+
+STAGE_PRE_BUILD = "PRE_BUILD"
+STAGE_POST_BUILD = "POST_BUILD"
+STAGE_AGGREGATION = "AGGREGATION"
+STAGE_POST_DEPLOY = "POST_DEPLOY"
+STAGE_CLOUD = "CLOUD"
+
+PIPELINE_STAGES = (
+    STAGE_PRE_BUILD,
+    STAGE_POST_BUILD,
+    STAGE_AGGREGATION,
+    STAGE_POST_DEPLOY,
+    STAGE_CLOUD,
+)
+
+
 # --- Scanner execution status ------------------------------------------------
 
 SCANNER_OK = "OK"
@@ -72,6 +89,7 @@ class SecurityCategory:
     tools: Tuple[str, ...] = ()
     description: str = ""
     runtime: bool = False  # contributes to RUNTIME_SECURITY rather than SECURITY
+    stage: str = "PRE_BUILD"
 
 
 # Ordered as they appear in the approved architecture diagram.
@@ -79,6 +97,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     # --- PRE-BUILD ---
     SecurityCategory(
         key="sast_sonarqube",
+        stage=STAGE_PRE_BUILD,
         title="Static Analysis (SonarQube)",
         phase=1,
         applies_when="always",
@@ -87,6 +106,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="sast_semgrep",
+        stage=STAGE_PRE_BUILD,
         title="Static Analysis (Semgrep / OpenGrep)",
         phase=2,
         applies_when="always",
@@ -95,6 +115,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="secret_scanning",
+        stage=STAGE_PRE_BUILD,
         title="Secret Scanning",
         phase=2,
         applies_when="always",
@@ -103,6 +124,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="sca_dependencies",
+        stage=STAGE_PRE_BUILD,
         title="Dependency / SCA",
         phase=2,
         applies_when="package_manager",
@@ -111,6 +133,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="iac_scanning",
+        stage=STAGE_PRE_BUILD,
         title="Infrastructure as Code",
         phase=2,
         applies_when="iac",
@@ -119,6 +142,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="api_spec_security",
+        stage=STAGE_PRE_BUILD,
         title="API Specification Security",
         phase=5,
         applies_when="openapi",
@@ -128,6 +152,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     # --- POST-BUILD ---
     SecurityCategory(
         key="container_image",
+        stage=STAGE_POST_BUILD,
         title="Container Image Scanning",
         phase=3,
         applies_when="docker",
@@ -136,6 +161,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="sbom",
+        stage=STAGE_POST_BUILD,
         title="SBOM Generation",
         phase=3,
         applies_when="package_manager_or_docker",
@@ -144,6 +170,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="frontend_bundle_secrets",
+        stage=STAGE_POST_BUILD,
         title="Frontend Bundle Secret Scanning",
         phase=3,
         applies_when="frontend",
@@ -152,6 +179,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="artifact_signing",
+        stage=STAGE_POST_BUILD,
         title="Artifact Signing / Provenance",
         phase=3,
         applies_when="docker",
@@ -160,6 +188,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="kubernetes_security",
+        stage=STAGE_POST_BUILD,
         title="Kubernetes Workload Security",
         phase=3,
         applies_when="kubernetes",
@@ -169,6 +198,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     # --- LIFECYCLE ---
     SecurityCategory(
         key="finding_lifecycle",
+        stage=STAGE_AGGREGATION,
         title="Finding Lifecycle / Accepted Risk",
         phase=4,
         applies_when="always",
@@ -178,6 +208,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     # --- POST-DEPLOYMENT (runtime) ---
     SecurityCategory(
         key="dast_zap",
+        stage=STAGE_POST_DEPLOY,
         title="Dynamic Application Security Testing",
         phase=5,
         applies_when="deployable",
@@ -187,6 +218,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="nuclei_templates",
+        stage=STAGE_POST_DEPLOY,
         title="Known-Vulnerability Probing",
         phase=5,
         applies_when="deployable",
@@ -196,6 +228,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="runtime_probes",
+        stage=STAGE_POST_DEPLOY,
         title="Runtime Security Probes",
         phase=5,
         applies_when="deployable",
@@ -206,6 +239,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     # --- CLOUD ---
     SecurityCategory(
         key="cloud_posture",
+        stage=STAGE_CLOUD,
         title="Cloud Security Posture",
         phase=6,
         applies_when="cloud",
@@ -214,6 +248,7 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
     ),
     SecurityCategory(
         key="iam_access_analyzer",
+        stage=STAGE_CLOUD,
         title="IAM Access Analyzer",
         phase=6,
         applies_when="cloud_aws",
@@ -238,6 +273,7 @@ class CategoryOutcome:
     notes: List[str] = field(default_factory=list)
     finding_count: int = 0
     runtime: bool = False
+    stage: str = ""
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -250,6 +286,7 @@ class CategoryOutcome:
             "notes": self.notes,
             "finding_count": self.finding_count,
             "runtime": self.runtime,
+            "stage": self.stage,
         }
 
 

@@ -9,12 +9,14 @@ name: default
 
 # Which phase of the roadmap is live. Categories with a higher phase resolve to
 # NOT_IMPLEMENTED and are printed in every report -- they never disappear.
-active_phase: 1
+active_phase: 6
 
 # Controls that MUST execute successfully for a PASS verdict. If any of these is
 # missing, failed, partial or untested, SECURITY resolves to NOT_VERIFIED.
 required_categories:
   - sast_sonarqube
+  - sast_semgrep
+  - secret_scanning
 
 # Which normalised finding categories count as security-relevant when evaluating
 # thresholds. Bugs and code smells are still collected and reported, but they do
@@ -22,6 +24,21 @@ required_categories:
 security_finding_categories:
   - vulnerability
   - security_hotspot
+  - sast_finding
+  - secret
+  - dependency_vulnerability
+  - container_vulnerability
+  - misconfiguration
+  - cloud_misconfiguration
+  - api_spec_finding
+  - dast_finding
+  - supply_chain
+  - security_header
+  - cookie_security
+  - cors
+  - tls
+  - exposed_surface
+  - information_disclosure
 
 # Maximum number of OPEN security-relevant findings permitted per canonical
 # severity. -1 means unlimited. UNKNOWN fails closed at 0: an unclassifiable
@@ -41,3 +58,12 @@ fail_on_quality_gate_error: true
 # always collected and always reported; set true to also count them against the
 # severity thresholds.
 hotspots_count_toward_thresholds: false
+
+# --- Phase 4: finding lifecycle -------------------------------------------
+# Suppressions must be reviewed. An exception with no expiry date, or a date in
+# the past, is treated as EXPIRED and does NOT suppress its finding.
+lifecycle:
+  require_expiry_on_exceptions: true
+  # Findings only count as FIXED when the scanner that produced them ran
+  # successfully in this run. A failed scanner must never look like remediation.
+  fixed_requires_successful_scanner: true

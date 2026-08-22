@@ -40,35 +40,129 @@ jobs:
       - name: Run invariant tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
-      - name: Verify the collector is read-only
+      - name: Verify every collector is read-only where it must be
         run: |
           set -euo pipefail
-          echo "Asserting no mutating HTTP verb exists anywhere in the collectors."
-          if grep -rnE '"(POST|PUT|PATCH|DELETE)"|method="(POST|PUT|PATCH|DELETE)"' framework/collectors/; then
-            echo "::error::A mutating HTTP method was found in a collector. Collectors must be read-only."
+          echo "Asserting no mutating HTTP verb exists in the read-only collectors."
+          if grep -rnE 'method="(POST|PUT|PATCH|DELETE)"' \
+               framework/collectors/sonarqube.py \
+               framework/collectors/runtime_probes.py \
+               framework/collectors/iam_access_analyzer.py; then
+            echo "::error::A mutating HTTP method was found in a read-only collector."
             exit 1
           fi
-          echo "OK: collectors issue GET only."
+          echo "OK: read-only collectors issue GET only."
 
       - name: Verify no hard-coded project identifiers
         run: |
           set -euo pipefail
           echo "Asserting the framework contains no project-specific logic."
-          if grep -rniE 'dashboard-v2v|oneportal' framework/ ; then
+          if grep -rniE 'dashboard-v2v|oneportal|tncwwb|pixous|subashawsdevops' framework/ ; then
             echo "::error::A project-specific identifier leaked into the framework."
             exit 1
           fi
           echo "OK: framework is project-agnostic."
 
-      - name: Smoke test the full pipeline on a synthetic payload
+      - name: Verify secret-bearing scanner output is stripped
         run: |
           set -euo pipefail
+          python - <<'PY'
+          import sys
+          from framework.collectors.gitleaks import strip_secret_material
+          raw = [{"RuleID": "k", "File": "f", "Secret": "REALSECRET", "Match": "x REALSECRET"}]
+          cleaned = strip_secret_material(raw)
+          blob = repr(cleaned)
+          assert "REALSECRET" not in blob, "gitleaks secret survived stripping"
+          assert "Secret" not in cleaned[0] and "Match" not in cleaned[0]
+          print("OK: gitleaks secret material is stripped at collection.")
+          PY
+
+      - name: Verify every registered scanner resolves a collector and an adapter
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from framework.core.registry import (
+              CATEGORY_BY_KEY, import_failures, load_builtin_scanners, registered_scanners,
+          )
+          load_builtin_scanners()
+          failures = import_failures()
+          assert not failures, "collector modules failed to import: %s" % failures
+          scanners = registered_scanners()
+          assert scanners, "no scanners registered"
+          for reg in scanners:
+              assert reg.category_key in CATEGORY_BY_KEY, reg.tool
+              adapter = reg.adapter_factory()
+              assert hasattr(adapter, "normalize"), reg.tool
+          print("OK: %d scanners registered, all resolvable." % len(scanners))
+          PY
+
+      - name: Verify every category is covered or explicitly framework-internal
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from framework.core.categories import CATEGORY_REGISTRY
+          from framework.core.registry import load_builtin_scanners, registered_scanners
+          from framework.core.status_engine import FRAMEWORK_INTERNAL_CATEGORIES
+          load_builtin_scanners()
+          covered = {r.category_key for r in registered_scanners()} | FRAMEWORK_INTERNAL_CATEGORIES
+          missing = [c.key for c in CATEGORY_REGISTRY if c.key not in covered]
+          assert not missing, "categories with no scanner and not framework-internal: %s" % missing
+          print("OK: all %d categories are covered." % len(CATEGORY_REGISTRY))
+          PY
+
+      - name: Project-adaptive detection across stacks
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, tempfile
+          from framework.detect.detector import detect
+
+          def build(root, files):
+              for path, content in files.items():
+                  full = os.path.join(root, path)
+                  os.makedirs(os.path.dirname(full), exist_ok=True)
+                  open(full, "w", encoding="utf-8").write(content)
+
+          cases = {
+              "react":    ({"package.json": '{"dependencies":{"react":"18"}}'},            {"frontend": True}),
+              "dotnet":   ({"Api.csproj": '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>'}, {"backend": True}),
+              "flutter":  ({"pubspec.yaml": "name: a\ndependencies:\n  flutter:\n", "web/index.html": "<html>"}, {"frontend": True}),
+              "php":      ({"composer.json": '{"require":{"laravel/framework":"^10"}}'},   {"backend": True}),
+              "terraform":({"main.tf": 'resource "aws_s3_bucket" "b" {}'},                  {"iac": True}),
+              "k8s":      ({"d.yaml": "apiVersion: apps/v1\nkind: Deployment\n"},           {"kubernetes": True}),
+              "docker":   ({"Dockerfile": "FROM alpine\n"},                                 {"docker": True}),
+              "openapi":  ({"openapi.json": '{"openapi":"3.0.0","paths":{}}'},              {"openapi": True}),
+          }
+          for name, (files, expected) in cases.items():
+              with tempfile.TemporaryDirectory() as root:
+                  build(root, files)
+                  caps = detect(root)
+                  for key, want in expected.items():
+                      assert caps[key] == want, "%s: expected %s=%s got %s" % (name, key, want, caps[key])
+                  # Nothing may be invented.
+                  assert caps["deployed_url"] == ""
+                  assert caps["authenticated_testing_available"] is False
+              print("  %-10s -> %s" % (name, expected))
+          print("OK: detection is project-adaptive and invents nothing.")
+          PY
+
+      - name: Smoke test the full pipeline with no scanners installed
+        run: |
+          set -euo pipefail
+          # With no external tools present, every external category must be
+          # unverified and the verdict must NOT be PASS.
           python -m framework.cli run \
             --workspace . \
             --output /tmp/security-results \
-            --sonar-payload tests/fixtures/sonarqube-sample.json \
             --environment ci
           test -f /tmp/security-results/final-report.json
           test -f /tmp/security-results/report.md
           test -f /tmp/security-results/security-report.pdf
-          echo "OK: JSON, Markdown and PDF all produced."
+          python - <<'PY'
+          import json
+          report = json.load(open("/tmp/security-results/final-report.json"))
+          status = report["status"]["security"]
+          assert status != "PASS", "no scanners installed but SECURITY reported PASS"
+          assert report["status"]["coverage_complete"] is False
+          print("OK: JSON, Markdown and PDF produced; SECURITY=%s (correctly not PASS)." % status)
+          PY

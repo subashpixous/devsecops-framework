@@ -39,6 +39,47 @@ checkout project             checkout framework @ job_workflow_sha
               upload artifact (always)
 ```
 
+## Pipeline stages
+
+Categories carry a `stage`, and `--stage` selects which run. This exists because
+the inputs each stage needs appear at different points in a delivery pipeline:
+
+| Stage | Needs | Categories |
+|---|---|---|
+| `PRE_BUILD` | source only | SonarQube, Semgrep, Gitleaks, Trivy SCA, Checkov, 42Crunch |
+| `POST_BUILD` | a built artifact | Trivy image, SBOM, bundle scanner, cosign, Trivy k8s |
+| `AGGREGATION` | findings from this run | finding lifecycle |
+| `POST_DEPLOY` | a live URL | ZAP, Nuclei, runtime probes |
+| `CLOUD` | cloud credentials | Prowler, IAM Access Analyzer |
+
+A category outside the executed stages resolves to `NOT_VERIFIED` with that
+reason. It never resolves to PASS, and it is never silently omitted.
+
+## Finding lifecycle (Phase 4)
+
+```
+current findings + baseline(normalized-findings.json) + exceptions
+                              │
+        ┌─────────────────────┴──────────────────────┐
+   in baseline?                                 in exceptions?
+        │                                             │
+   yes → EXISTING                        expired/undated → EXPIRED_EXCEPTION
+   no  → NEW                                            (NOT suppressed)
+        │                                    valid → FALSE_POSITIVE
+   in baseline but absent now:                       ACCEPTED_RISK
+        scanner ran OK → FIXED                        (suppressed)
+        scanner failed → UNKNOWN
+```
+
+Two rules are load-bearing:
+
+* **An expired suppression does not suppress.** An exception with no expiry
+  date is treated as expired. Without a review point, accepted risk decays into
+  permanent silent acceptance.
+* **`FIXED` requires a successful scanner.** If the scanner that originally
+  produced a finding did not complete, its absence is `UNKNOWN`. A broken
+  scanner must never look like remediation.
+
 ## Module map
 
 | Module | Responsibility | May not |
@@ -50,6 +91,9 @@ checkout project             checkout framework @ job_workflow_sha
 | `core/registry.py` | Binds tools to categories; the Phase 2–6 extension point | import collectors eagerly |
 | `core/manual_controls.py` | The controls automation cannot cover | ever be marked tested by the framework |
 | `detect/detector.py` | Evidence-based capability detection | guess a value it cannot establish |
+| `core/toolrunner.py` | One execution path for external tools: availability, timeout, exit-code semantics, redaction | raise; leak a secret into captured output |
+| `core/lifecycle.py` | NEW/EXISTING/FIXED/suppression/expiry | suppress an expired exception |
+| `core/secretpatterns.py` | Shared detectors for built and live bundles | return a matched secret value |
 | `collectors/*` | Talk to one scanner backend each | decide a verdict, or raise past their boundary |
 | `adapters/*` | Pure payload → findings transformation | perform network I/O |
 | `report/*` | Render `final-report.json` | recompute or reinterpret a status |
@@ -101,6 +145,25 @@ Adding a scanner never changes the engine:
 
 The category already exists and is already being reported as `NOT_IMPLEMENTED`,
 so the change is additive by construction.
+
+## Secret hygiene
+
+Findings end up in a downloadable CI artifact, so no code path may place a
+credential in one. Enforced at four points:
+
+1. **Gitleaks** — `Secret` and `Match` stripped in the collector, before the
+   payload is attached to the result. A length and a redaction flag are kept.
+2. **Gitleaks adapter** — refuses to normalise any record still carrying those
+   fields, and fails the result instead. A stripping regression fails loudly
+   rather than publishing secrets.
+3. **Bundle and runtime scanners** — report `len=N sha256:<12 hex>`, never the
+   value. Two occurrences can be correlated; neither can be recovered.
+4. **Tool runner** — redacts known secret-bearing environment variable values
+   and generic key shapes from all captured stdout/stderr.
+
+Additionally: Trivy's secret scanner is disabled (it embeds raw values, and
+Gitleaks owns the category); Semgrep's `extra.lines` matched source is dropped;
+ZAP `evidence` and Nuclei `extracted-results` response echoes are dropped.
 
 ## Supply chain
 

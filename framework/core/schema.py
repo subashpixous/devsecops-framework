@@ -48,6 +48,10 @@ EXTENSION_SCHEMA_KEYS = [
     "effort",
     "phase",
     "scanner_category",
+    "lifecycle",
+    "exception_reason",
+    "exception_expires",
+    "exception_owner",
 ]
 
 # --- Canonical severity ------------------------------------------------------
@@ -179,6 +183,12 @@ class Finding:
     effort: str = ""
     phase: int = 0
     scanner_category: str = ""
+
+    # Phase 4 lifecycle (set by framework.core.lifecycle)
+    lifecycle: str = "UNKNOWN"
+    exception_reason: str = ""
+    exception_expires: str = ""
+    exception_owner: str = ""
 
     def __post_init__(self) -> None:
         self.severity = normalise_severity(self.severity or self.raw_severity)

@@ -185,6 +185,54 @@ def render_markdown(report: Dict[str, Any]) -> str:  # noqa: C901 - linear docum
         add("| %s | %d |" % (severity, count))
     add("")
 
+    # --- Lifecycle ------------------------------------------------------------
+    lifecycle = report.get("lifecycle") or {}
+    counts = lifecycle.get("counts") or {}
+    add("---")
+    add("")
+    add("## 6.1 Finding Aggregation (New / Existing / Fixed)")
+    add("")
+    add("| State | Count |")
+    add("|---|---|")
+    for label, key in (("New", "new"), ("Existing / still open", "existing"), ("Fixed", "fixed"),
+                       ("False positive (suppressed)", "false_positive"),
+                       ("Accepted risk (suppressed)", "accepted_risk"),
+                       ("EXPIRED suppression (NOT suppressed)", "expired_exceptions"),
+                       ("Unknown", "unknown")):
+        add("| %s | %s |" % (label, counts.get(key, 0)))
+    add("")
+    add("| Field | Value |")
+    add("|---|---|")
+    add("| Baseline available | %s |" % ("YES" if lifecycle.get("baseline_available") else "NO"))
+    add("| Baseline source | %s |" % _escape(lifecycle.get("baseline_source") or "none"))
+    add("| Baseline findings | %s |" % lifecycle.get("baseline_finding_count", 0))
+    add("| Exceptions loaded | %s |" % lifecycle.get("exceptions_loaded", 0))
+    add("")
+    for note in lifecycle.get("notes") or []:
+        add("> %s" % _escape(note))
+        add("")
+    if lifecycle.get("expired_exception_details"):
+        add("**Expired suppressions — these findings are NOT suppressed**")
+        add("")
+        add("| Fingerprint | Kind | Owner | Expiry | Why |")
+        add("|---|---|---|---|---|")
+        for item in lifecycle["expired_exception_details"]:
+            add("| `%s` | %s | %s | %s | %s |" % (
+                _escape(item.get("fingerprint", ""))[:16], _escape(item.get("kind")),
+                _escape(item.get("owner") or "-"), _escape(item.get("expires") or "none"),
+                _escape(item.get("why"))))
+        add("")
+    if lifecycle.get("fixed_findings"):
+        add("**Fixed since baseline**")
+        add("")
+        add("| Severity | Tool | File | Description |")
+        add("|---|---|---|---|")
+        for item in lifecycle["fixed_findings"][:40]:
+            add("| %s | %s | %s | %s |" % (
+                _escape(item.get("severity")), _escape(item.get("tool")),
+                _truncate(item.get("file"), 50), _truncate(item.get("description"), 70)))
+        add("")
+
     # --- Findings -------------------------------------------------------------
     add("---")
     add("")
@@ -199,13 +247,13 @@ def render_markdown(report: Dict[str, Any]) -> str:  # noqa: C901 - linear docum
         add("")
     else:
         shown = items[:MAX_TABLE_ROWS]
-        add("| # | Severity | Category | File | Line | Rule | Description |")
-        add("|---|---|---|---|---|---|---|")
+        add("| # | Severity | State | Category | Tool | File | Line | Description |")
+        add("|---|---|---|---|---|---|---|---|")
         for index, finding in enumerate(shown, 1):
-            add("| %d | %s | %s | %s | %s | %s | %s |" % (
-                index, finding["severity"], finding["category"],
-                _truncate(finding["file"], 60) or "-", finding["line"] or "-",
-                _escape(finding.get("rule")) or "-", _truncate(finding["description"], 90),
+            add("| %d | %s | %s | %s | %s | %s | %s | %s |" % (
+                index, finding["severity"], finding.get("lifecycle", "-"), finding["category"],
+                _escape(finding.get("tool")), _truncate(finding["file"], 46) or "-",
+                finding["line"] or "-", _truncate(finding["description"], 80),
             ))
         add("")
         if len(items) > MAX_TABLE_ROWS:
@@ -221,6 +269,7 @@ def render_markdown(report: Dict[str, Any]) -> str:  # noqa: C901 - linear docum
             add("| Field | Value |")
             add("|---|---|")
             add("| Fingerprint | `%s` |" % finding["fingerprint"])
+            add("| Lifecycle state | %s |" % _escape(finding.get("lifecycle")))
             add("| Tool | %s |" % _escape(finding["tool"]))
             add("| Category | %s |" % _escape(finding["category"]))
             add("| Severity | %s |" % _escape(finding["severity"]))

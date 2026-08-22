@@ -11,7 +11,11 @@
 #         SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 #
 # This workflow NEVER builds, deploys, or modifies the calling project. It reads
-# the repository, reads the analysis server, and writes reports to an artifact.
+# the repository, reads the analysis server, optionally probes an explicitly
+# supplied deployed URL, and writes reports to an artifact.
+#
+# Scanner availability is never fatal: a tool that fails to install makes its
+# category NOT_VERIFIED. It can never make it PASS.
 
 name: Security Pipeline (Reusable)
 
@@ -31,15 +35,49 @@ on:
         type: string
         default: ""
       deployed_url:
-        description: "Live URL for future runtime testing. Left NOT_ESTABLISHED if empty."
+        description: "Live URL for post-deployment testing. Runtime stages are SKIPPED without it."
+        type: string
+        default: ""
+      stages:
+        description: "Comma-separated stages: PRE_BUILD,POST_BUILD,AGGREGATION,POST_DEPLOY,CLOUD. Default: all."
+        type: string
+        default: ""
+      images:
+        description: "Comma-separated container image refs for image/SBOM/signature scanning."
+        type: string
+        default: ""
+      bundle_dirs:
+        description: "Comma-separated built frontend directories. Auto-detected when empty."
+        type: string
+        default: ""
+      openapi_files:
+        description: "Comma-separated OpenAPI spec paths. Auto-detected when empty."
+        type: string
+        default: ""
+      cloud:
+        description: "Cloud provider for posture scanning (aws|azure|gcp). Auto-detected when empty."
+        type: string
+        default: ""
+      aws_region:
+        type: string
+        default: ""
+      zap_mode:
+        description: "baseline (passive, safe) or full (ACTIVE scan - only where authorised)."
+        type: string
+        default: "baseline"
+      baseline_path:
+        description: "Path in the calling repo to a previous normalized-findings.json for lifecycle diffing."
+        type: string
+        default: ""
+      exceptions_path:
+        description: "Path in the calling repo to the exceptions / accepted-risk file."
         type: string
         default: ""
       sonar_project_key:
-        description: "Override SonarQube project key resolution."
         type: string
         default: ""
       policy_path:
-        description: "Path (inside the calling repo) to a policy override file."
+        description: "Path in the calling repo to a policy override file."
         type: string
         default: ""
       build_status:
@@ -47,23 +85,24 @@ on:
         type: string
         default: ""
       deployment_status:
-        description: "Deployment result reported by the caller (deployed/failed/skipped). Never inferred."
+        description: "Deployment result reported by the caller. Never inferred."
         type: string
         default: ""
       active_phase:
-        description: "Roadmap phase to execute. Phase 1 = SonarQube only."
         type: number
-        default: 1
+        default: 6
+      install_tools:
+        description: "Install the external scanners. Disable to use a pre-baked runner image."
+        type: boolean
+        default: true
       fail_on_security:
         description: "Fail the job when SECURITY is not PASS. Default false: observe, do not block."
         type: boolean
         default: false
       framework_repository:
-        description: "Framework repo to check out. Change only when running from a fork."
         type: string
         default: "subashpixous/devsecops-framework"
       framework_ref:
-        description: "Fallback framework ref if the job workflow SHA is unavailable."
         type: string
         default: "main"
       artifact_name:
@@ -75,19 +114,31 @@ on:
       python_version:
         type: string
         default: "3.11"
+      runs_on:
+        type: string
+        default: "ubuntu-latest"
     secrets:
       SONAR_TOKEN:
         description: "Existing SonarQube token. Used read-only; never rotated or logged."
-        required: true
+        required: false
       SONAR_HOST_URL:
         description: "Existing SonarQube host URL."
-        required: true
+        required: false
+      FORTYTWO_CRUNCH_TOKEN:
+        description: "42Crunch API token. Without it, API spec security reports NOT_VERIFIED."
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      COSIGN_PUBLIC_KEY:
+        description: "Public key for signature verification. Verification only; never signs."
+        required: false
     outputs:
       security_status:
         description: "PASS | FAILED | NOT_VERIFIED"
         value: ${{ jobs.security.outputs.security_status }}
       runtime_security_status:
-        description: "PASS | FAILED | NOT_TESTED"
         value: ${{ jobs.security.outputs.runtime_security_status }}
       build_status:
         value: ${{ jobs.security.outputs.build_status }}
@@ -95,6 +146,10 @@ on:
         value: ${{ jobs.security.outputs.deployment_status }}
       open_findings:
         value: ${{ jobs.security.outputs.open_findings }}
+      new_findings:
+        value: ${{ jobs.security.outputs.new_findings }}
+      fixed_findings:
+        value: ${{ jobs.security.outputs.fixed_findings }}
       coverage_complete:
         description: "false whenever any applicable category was not tested."
         value: ${{ jobs.security.outputs.coverage_complete }}
@@ -105,7 +160,7 @@ permissions:
 jobs:
   security:
     name: Security validation
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     # Least privilege: read the code, write nothing.
     permissions:
       contents: read
@@ -115,17 +170,18 @@ jobs:
       build_status: ${{ steps.run.outputs.build_status }}
       deployment_status: ${{ steps.run.outputs.deployment_status }}
       open_findings: ${{ steps.run.outputs.open_findings }}
+      new_findings: ${{ steps.run.outputs.new_findings }}
+      fixed_findings: ${{ steps.run.outputs.fixed_findings }}
       coverage_complete: ${{ steps.run.outputs.coverage_complete }}
 
     steps:
       # NOTE: actions below are referenced by version tag. They are NOT SHA-pinned
       # yet -- see docs/ARCHITECTURE.md "Supply chain" for the pinning procedure.
-      # Pin before treating this workflow as production-hardened.
       - name: Checkout project under analysis
         uses: actions/checkout@v4
         with:
           path: project
-          fetch-depth: 0
+          fetch-depth: 0          # full history: gitleaks scans past commits
           persist-credentials: false
 
       - name: Checkout security framework
@@ -155,23 +211,92 @@ jobs:
           echo "Verifying framework invariants before trusting any verdict it produces."
           python -m unittest discover -s tests -p "test_*.py"
 
+      # Every install is best-effort. A tool that fails to install makes its
+      # category NOT_VERIFIED, which the status engine already handles.
+      - name: Install security scanners
+        if: inputs.install_tools
+        continue-on-error: true
+        env:
+          TRIVY_VERSION: "0.58.2"
+          GITLEAKS_VERSION: "8.23.1"
+          NUCLEI_VERSION: "3.3.7"
+        run: |
+          set -uo pipefail
+          install_log=/tmp/tool-install.log
+          : > "$install_log"
+
+          try() {
+            echo "--- installing $1 ---" | tee -a "$install_log"
+            shift
+            if "$@" >>"$install_log" 2>&1; then
+              echo "    OK"
+            else
+              echo "    FAILED (category will report NOT_VERIFIED)"
+            fi
+          }
+
+          try semgrep python -m pip install --quiet semgrep
+          try checkov python -m pip install --quiet checkov
+
+          try gitleaks bash -c '
+            curl -sSfL -o /tmp/gitleaks.tar.gz \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" &&
+            tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks'
+
+          try trivy bash -c '
+            curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh |
+              sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"'
+
+          try nuclei bash -c '
+            curl -sSfL -o /tmp/nuclei.zip \
+              "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" &&
+            unzip -oq /tmp/nuclei.zip -d /usr/local/bin nuclei'
+
+          try cosign bash -c '
+            curl -sSfL -o /usr/local/bin/cosign \
+              "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64" &&
+            chmod +x /usr/local/bin/cosign'
+
+          echo "=== scanner availability ==="
+          for t in semgrep gitleaks trivy checkov nuclei cosign docker; do
+            printf '  %-10s %s\n' "$t" "$(command -v "$t" >/dev/null && echo AVAILABLE || echo MISSING)"
+          done
+
+      - name: Report scanner availability
+        working-directory: framework
+        run: python -m framework.cli tools
+
       - name: Run security validation
         id: run
         working-directory: framework
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-          # Inputs are passed through the environment rather than interpolated into
-          # the shell, so a hostile input value cannot become a shell command.
+          FORTYTWO_CRUNCH_TOKEN: ${{ secrets.FORTYTWO_CRUNCH_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          # Inputs are passed through the environment rather than interpolated
+          # into the shell, so a hostile input value cannot become a command.
           IN_PROJECT_NAME: ${{ inputs.project_name }}
           IN_ENVIRONMENT: ${{ inputs.environment }}
           IN_DEPLOYMENT_TARGET: ${{ inputs.deployment_target }}
           IN_DEPLOYED_URL: ${{ inputs.deployed_url }}
+          IN_STAGES: ${{ inputs.stages }}
+          IN_IMAGES: ${{ inputs.images }}
+          IN_BUNDLE_DIRS: ${{ inputs.bundle_dirs }}
+          IN_OPENAPI_FILES: ${{ inputs.openapi_files }}
+          IN_CLOUD: ${{ inputs.cloud }}
+          IN_AWS_REGION: ${{ inputs.aws_region }}
+          IN_ZAP_MODE: ${{ inputs.zap_mode }}
+          IN_BASELINE_PATH: ${{ inputs.baseline_path }}
+          IN_EXCEPTIONS_PATH: ${{ inputs.exceptions_path }}
           IN_SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
+          IN_POLICY_PATH: ${{ inputs.policy_path }}
           IN_BUILD_STATUS: ${{ inputs.build_status }}
           IN_DEPLOYMENT_STATUS: ${{ inputs.deployment_status }}
           IN_ACTIVE_PHASE: ${{ inputs.active_phase }}
-          IN_POLICY_PATH: ${{ inputs.policy_path }}
           IN_FAIL_ON_SECURITY: ${{ inputs.fail_on_security }}
         run: |
           set -euo pipefail
@@ -183,19 +308,32 @@ jobs:
             --environment "${IN_ENVIRONMENT}"
             --deployment-target "${IN_DEPLOYMENT_TARGET}"
             --deployed-url "${IN_DEPLOYED_URL}"
+            --images "${IN_IMAGES}"
+            --bundle-dirs "${IN_BUNDLE_DIRS}"
+            --openapi-files "${IN_OPENAPI_FILES}"
+            --cloud "${IN_CLOUD}"
+            --aws-region "${IN_AWS_REGION}"
+            --zap-mode "${IN_ZAP_MODE}"
             --sonar-project-key "${IN_SONAR_PROJECT_KEY}"
             --build-status "${IN_BUILD_STATUS}"
             --deployment-status "${IN_DEPLOYMENT_STATUS}"
             --active-phase "${IN_ACTIVE_PHASE}"
           )
-          if [ -n "${IN_POLICY_PATH}" ]; then
-            args+=( --policy "${GITHUB_WORKSPACE}/project/${IN_POLICY_PATH}" )
-          fi
-          if [ "${IN_FAIL_ON_SECURITY}" = "true" ]; then
-            args+=( --fail-on-security )
-          fi
+          [ -n "${IN_STAGES}" ]          && args+=( --stage "${IN_STAGES}" )
+          [ -n "${IN_POLICY_PATH}" ]     && args+=( --policy "${GITHUB_WORKSPACE}/project/${IN_POLICY_PATH}" )
+          [ -n "${IN_BASELINE_PATH}" ]   && args+=( --baseline "${GITHUB_WORKSPACE}/project/${IN_BASELINE_PATH}" )
+          [ -n "${IN_EXCEPTIONS_PATH}" ] && args+=( --exceptions "${GITHUB_WORKSPACE}/project/${IN_EXCEPTIONS_PATH}" )
+          [ "${IN_FAIL_ON_SECURITY}" = "true" ] && args+=( --fail-on-security )
 
           python -m framework.cli run "${args[@]}"
+
+      - name: Collect tool install log
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/security-results"
+          [ -f /tmp/tool-install.log ] && \
+            cp /tmp/tool-install.log "${GITHUB_WORKSPACE}/security-results/tool-install.log" || true
 
       - name: Upload security results
         # always(): a failed or blocked run is exactly when the evidence matters most.

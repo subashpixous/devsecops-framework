@@ -1,8 +1,9 @@
 # Example thin caller. Copy into any project as .github/workflows/security.yml
 #
 # This is the ENTIRE per-project integration. Everything else lives in the
-# framework, so onboarding a Flutter, React, Java, Python, PHP or .NET project
-# means copying this file and changing the labels -- never the security logic.
+# framework, so onboarding a Flutter, React, Angular, Node, .NET, Java, Python
+# or PHP project means copying this file and changing the labels -- never the
+# security logic.
 #
 # It runs alongside the project's existing build/deploy workflow and has no
 # dependency on it in either direction.
@@ -20,21 +21,71 @@ permissions:
   contents: read
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Simplest possible integration: source-code security only.
+  # Scanners that need a build artifact or a live URL report NOT_VERIFIED.
+  # ---------------------------------------------------------------------------
   security:
     # Pin to a SHA in production. A tag is mutable; a SHA is not, and repinning
     # the previous SHA is the rollback path for a bad framework release.
-    uses: subashpixous/devsecops-framework/.github/workflows/security-pipeline.yml@v0.1.0
+    uses: subashpixous/devsecops-framework/.github/workflows/security-pipeline.yml@v0.2.0
     with:
       environment: production
+      stages: PRE_BUILD
 
       # Supply these only when they are actually known. Anything left empty is
       # reported as NOT_ESTABLISHED rather than guessed.
       deployment_target: ""
       deployed_url: ""
 
-      # Phase 1 observes and reports. It does not block delivery.
-      active_phase: 1
+      # Lifecycle: point at a committed baseline to get NEW / EXISTING / FIXED
+      # instead of "everything is new".
+      # baseline_path: .security/baseline-findings.json
+      # exceptions_path: .security/exceptions.yml
+
+      # Observe, do not block.
       fail_on_security: false
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+# ---------------------------------------------------------------------------
+# FULL LIFECYCLE EXAMPLE
+# ---------------------------------------------------------------------------
+# Once the pre-build stage is trusted, wire the remaining stages to the points
+# in your existing pipeline where their inputs actually exist. The framework
+# never changes how you build or deploy -- it only observes around it.
+#
+#   post_build_security:
+#     needs: build                     # your existing build job
+#     uses: <owner>/devsecops-framework/.github/workflows/security-pipeline.yml@<sha>
+#     with:
+#       stages: POST_BUILD
+#       images: myorg/myapp:${{ github.sha }}    # the image your build produced
+#       bundle_dirs: UI/dist                     # built frontend output
+#       build_status: ${{ needs.build.result }}
+#     secrets:
+#       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+#       SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+#       COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+#
+#   post_deploy_security:
+#     needs: deploy                    # your existing deploy job
+#     if: always()                     # security runs even if deployment failed
+#     uses: <owner>/devsecops-framework/.github/workflows/security-pipeline.yml@<sha>
+#     with:
+#       stages: POST_DEPLOY,CLOUD
+#       deployed_url: https://app.example.com
+#       zap_mode: baseline             # 'full' sends ACTIVE attack payloads
+#       cloud: aws
+#       aws_region: ap-south-1
+#       deployment_status: ${{ needs.deploy.result }}
+#     secrets:
+#       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+#       SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+#       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#
+# Note on `deployment_status`: it is passed so the report can state it, not so
+# it can influence the verdict. A successful deployment never raises the
+# security status, and a failed one never lowers it.

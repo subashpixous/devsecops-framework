@@ -474,6 +474,60 @@ def build_pdf(report: Dict[str, Any], output_path: str) -> str:  # noqa: C901 - 
         )
     )
 
+    # --- Finding aggregation (lifecycle) --------------------------------------
+    lifecycle = report.get("lifecycle") or {}
+    counts = lifecycle.get("counts") or {}
+    story.append(Paragraph("5.1 Finding aggregation (new / existing / fixed)", styles.h1))
+    story.append(
+        _data_table(
+            ["State", "Count"],
+            [
+                ["New", counts.get("new", 0)],
+                ["Existing / still open", counts.get("existing", 0)],
+                ["Fixed since baseline", counts.get("fixed", 0)],
+                ["False positive (suppressed)", counts.get("false_positive", 0)],
+                ["Accepted risk (suppressed)", counts.get("accepted_risk", 0)],
+                ["EXPIRED suppression (NOT suppressed)", counts.get("expired_exceptions", 0)],
+                ["Unknown (scanner did not run)", counts.get("unknown", 0)],
+            ],
+            [95 * mm, 75 * mm],
+            styles,
+        )
+    )
+    story.append(Spacer(1, 3 * mm))
+    story.append(
+        _kv_table(
+            [
+                ("Baseline available", "YES" if lifecycle.get("baseline_available") else "NO"),
+                ("Baseline source", lifecycle.get("baseline_source") or "none"),
+                ("Baseline findings", lifecycle.get("baseline_finding_count", 0)),
+                ("Exceptions loaded", lifecycle.get("exceptions_loaded", 0)),
+            ],
+            styles,
+        )
+    )
+    for note in lifecycle.get("notes") or []:
+        story.append(Spacer(1, 2 * mm))
+        story.append(Paragraph("&bull; %s" % _text(note), styles.note))
+    if lifecycle.get("expired_exception_details"):
+        story.append(Spacer(1, 3 * mm))
+        story.append(Paragraph(
+            "<b>Expired suppressions — these findings are NOT suppressed and count against policy.</b>",
+            styles.warn))
+        story.append(Spacer(1, 2 * mm))
+        story.append(
+            _data_table(
+                ["Fingerprint", "Kind", "Owner", "Expiry", "Why"],
+                [
+                    [str(i.get("fingerprint", ""))[:14], i.get("kind"), i.get("owner") or "-",
+                     i.get("expires") or "none", i.get("why")]
+                    for i in lifecycle["expired_exception_details"]
+                ],
+                [30 * mm, 26 * mm, 26 * mm, 26 * mm, 62 * mm],
+                styles,
+            )
+        )
+
     # --- Findings ------------------------------------------------------------
     story.append(PageBreak())
     story.append(Paragraph("6. Findings", styles.h1))
@@ -498,17 +552,18 @@ def build_pdf(report: Dict[str, Any], output_path: str) -> str:  # noqa: C901 - 
                         % (SEVERITY_COLOURS.get(finding["severity"], "#212121"), _text(finding["severity"])),
                         styles.small,
                     ),
-                    finding["category"],
-                    Paragraph(_text(finding["file"], 70) or "-", styles.small),
+                    Paragraph(_text(finding.get("lifecycle", "-")), styles.small),
+                    Paragraph(_text(finding.get("tool")), styles.small),
+                    Paragraph(_text(finding["file"], 60) or "-", styles.small),
                     finding["line"] or "-",
-                    Paragraph(_text(finding["description"], 120), styles.small),
+                    Paragraph(_text(finding["description"], 110), styles.small),
                 ]
             )
         story.append(
             _data_table(
-                ["#", "Severity", "Category", "File", "Line", "Description"],
+                ["#", "Severity", "State", "Tool", "File", "Line", "Description"],
                 rows,
-                [9 * mm, 20 * mm, 24 * mm, 52 * mm, 12 * mm, 53 * mm],
+                [8 * mm, 18 * mm, 18 * mm, 22 * mm, 40 * mm, 10 * mm, 54 * mm],
                 styles,
             )
         )
@@ -532,6 +587,7 @@ def build_pdf(report: Dict[str, Any], output_path: str) -> str:  # noqa: C901 - 
                 _kv_table(
                     [
                         ("Fingerprint", finding["fingerprint"]),
+                        ("Lifecycle state", finding.get("lifecycle", "")),
                         ("Tool / rule", "%s / %s" % (finding["tool"], finding.get("rule") or "n/a")),
                         ("Category", finding["category"]),
                         ("Severity", finding["severity"]),

@@ -1,0 +1,49 @@
+# Finding exceptions / accepted risk — EXAMPLE
+#
+# Copy into the CALLING project (not the framework) and point the pipeline at it
+# with the `exceptions_path` input.
+#
+# ---------------------------------------------------------------------------
+# THE RULE THAT MATTERS
+# ---------------------------------------------------------------------------
+# An exception with no `expires` date, or with a date in the past, is treated as
+# EXPIRED. An expired exception does NOT suppress its finding: the finding
+# counts against policy again, and the `finding_lifecycle` category reports
+# FAILED.
+#
+# This is deliberate. A suppression with no review point becomes permanent
+# silent acceptance, which is how risk registers rot. Every entry must be
+# re-justified on a schedule.
+# ---------------------------------------------------------------------------
+#
+# Fields:
+#   fingerprint  REQUIRED. Copy from normalized-findings.json. Fingerprints are
+#                line-independent, so they survive unrelated edits to the file.
+#   kind         REQUIRED. false_positive | accepted_risk
+#                  false_positive -> the scanner is wrong; the issue is not real
+#                  accepted_risk  -> the issue is real and consciously accepted
+#   reason       REQUIRED in practice. Why this is suppressed. Be specific
+#                enough that a reviewer who was not present can judge it.
+#   owner        Who owns the decision and the review.
+#   expires      REQUIRED for the suppression to take effect. ISO date.
+
+exceptions:
+  # A real issue, consciously accepted for a bounded period.
+  - fingerprint: "0000000000000000000000000000abcd"
+    kind: accepted_risk
+    reason: >-
+      Maps API key is public by design in a browser bundle. Compensating control:
+      HTTP-referrer and API restrictions applied in the Google Cloud console,
+      with quota caps and billing alerts. Tracked as SEC-1421.
+    owner: platform-team
+    expires: "2026-12-31"
+
+  # A scanner false positive.
+  - fingerprint: "1111111111111111111111111111beef"
+    kind: false_positive
+    reason: >-
+      Semgrep flags this as SQL injection, but the interpolated value is a
+      compile-time constant from an internal enum and is never request-derived.
+      Verified by code review on 2026-08-22.
+    owner: backend-team
+    expires: "2027-02-28"

@@ -34,6 +34,7 @@ class ScannerRegistration:
 
 
 _REGISTRY: Dict[str, ScannerRegistration] = {}
+_IMPORT_FAILURES: Dict[str, str] = {}
 
 
 def register_scanner(registration: ScannerRegistration) -> ScannerRegistration:
@@ -66,14 +67,39 @@ def implemented_category_keys(active_phase: int) -> List[str]:
 
 
 def load_builtin_scanners() -> None:
-    """Import modules that self-register.
+    """Import every collector module so each self-registers.
 
-    Imported lazily so that a broken optional scanner cannot prevent the
-    framework from starting up and producing a NOT_VERIFIED report.
+    Imported inside the function, and each in its own try block, so that one
+    broken or partially-installed scanner can never prevent the framework from
+    starting up and producing a NOT_VERIFIED report for the rest.
     """
-    from ..collectors import sonarqube as _sonarqube  # noqa: F401
+    modules = (
+        # PRE-BUILD
+        "sonarqube", "semgrep", "gitleaks", "checkov", "apispec",
+        # PRE-BUILD + POST-BUILD (trivy registers four scanners)
+        "trivy",
+        # POST-BUILD
+        "bundle_scanner", "cosign",
+        # POST-DEPLOY
+        "zap", "nuclei", "runtime_probes",
+        # CLOUD
+        "prowler", "iam_access_analyzer",
+    )
+    import importlib
 
-    # Phase 2+: gitleaks, trivy, semgrep, checkov
-    # Phase 3+: trivy-image, sbom, bundle-scanner, cosign
-    # Phase 5+: zap, nuclei, runtime-probes
-    # Phase 6+: prowler, iam-access-analyzer
+    # framework.core -> framework
+    root_package = (__package__ or "framework.core").rsplit(".", 1)[0]
+    for name in modules:
+        try:
+            importlib.import_module("%s.collectors.%s" % (root_package, name))
+        except Exception as exc:  # noqa: BLE001 - a broken scanner must not break startup
+            _IMPORT_FAILURES[name] = "%s: %s" % (type(exc).__name__, exc)
+
+
+def import_failures() -> Dict[str, str]:
+    """Collector modules that failed to import, with the reason.
+
+    Surfaced in the report so a scanner that silently failed to load is visible
+    rather than simply absent.
+    """
+    return dict(_IMPORT_FAILURES)
