@@ -3,6 +3,87 @@
 All notable changes to this framework are recorded here. Releases are immutable
 tags; callers pin a tag or SHA, and rollback means repinning the previous one.
 
+## [0.2.1] — 2026-08-22
+
+Fixes from the first real GitHub Actions runner validation. One of them is a
+false-PASS defect and is the reason this release exists.
+
+### Fixed — CRITICAL: `succeed()` erased a recorded degradation (false PASS)
+
+Runner run `32592212680` reported:
+
+```
+Dependency / SCA ......... PASS
+  note: no lockfile or manifest was recognised; coverage may be incomplete
+```
+
+Nothing was scanned, yet the category passed — exactly the failure mode this
+framework exists to prevent.
+
+Two interacting bugs in `ScannerResult`:
+
+1. `partial()` guarded on `status != FAILED`. `FAILED` is also the fail-closed
+   *initial* value, so `partial()` never actually set `PARTIAL` on a fresh
+   result — it only appended a warning.
+2. `succeed()` then promoted to `OK` whenever `errors` was empty. `partial()`
+   records a **warning**, never an error, so every partially-degraded scan was
+   silently upgraded to fully trusted and `is_trustworthy` returned `True`.
+
+**Blast radius: 11 of 15 collector modules call `partial()` then `succeed()`.**
+
+Fix:
+
+- `ScannerResult` gains an explicit `degraded` flag, set by `fail()`,
+  `partial()` and `skip()`.
+- `succeed()` promotes to `OK` only when there are no errors **and** nothing is
+  degraded. The fail-closed default still lets a genuinely clean run reach `OK`.
+- `partial()` now keys off recorded errors rather than status, so it reports
+  `PARTIAL` instead of being swallowed.
+- `replay()` added for the self-test payload-injection path.
+- `degraded` is surfaced on every scanner record in every report.
+
+Verified on the runner: the same project now yields `trivy-sca` = `PARTIAL`,
+`is_trustworthy` = `False`, `sca_dependencies` = `NOT_VERIFIED`.
+
+### Fixed — Trivy omits `Results` on a clean scan
+
+Trivy returns `rc=0`, `SchemaVersion 2` and **no `Results` key** when a completed
+scan has nothing to report — for example a pip project whose requirements are
+unpinned ranges, so no concrete package version resolves. The adapter treated
+that as "output cannot be trusted" and blamed a healthy tool.
+
+A payload carrying `SchemaVersion` but no `Results` is now zero findings; a
+payload without `SchemaVersion` is still a real failure. The collector's
+`PARTIAL` warning keeps the category at `NOT_VERIFIED`, so the verdict is
+unchanged — only the reported reason became accurate.
+
+### Fixed — trivy install pinned a tag that does not exist
+
+`TRIVY_VERSION` was `0.58.2`; tag `v0.58.2` returns 404 from the GitHub API.
+Pinned to `0.74.0` (asset verified) and switched from `curl | sh` to the direct
+release-tarball pattern already used by gitleaks and nuclei, which also removes
+a pipe-to-shell from the supply chain.
+
+### Fixed — timezone-dependent lifecycle tests
+
+`tests/test_lifecycle.py` built expiry fixtures from the **local** calendar while
+the framework evaluates expiry in **UTC**. Where local runs ahead of UTC,
+yesterday-local is still today-UTC and two expiry tests failed. The framework is
+correct — UTC is deterministic regardless of where CI runs — so the fixtures now
+use UTC. This never failed on the runner, which is UTC; it was a local-only flake.
+
+### Added
+
+- `.github/workflows/pipeline-validation.yml` — calls the reusable pipeline by
+  full external reference, the way a consumer does, so the cross-repository
+  resolution path, scanner installation and artifact upload are exercised in CI.
+  `security-pipeline.yml` is `workflow_call`-only and would otherwise never run.
+
+### Tests
+
+126, up from 119. Five new regression tests lock the `degraded` invariant in;
+two cover the Trivy `Results` semantics.
+
 ## [0.2.0] — 2026-08-22
 
 The complete approved pipeline. Phases 2 through 6 implemented; Phase 1
