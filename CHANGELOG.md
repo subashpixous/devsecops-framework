@@ -3,6 +3,31 @@
 All notable changes to this framework are recorded here. Releases are immutable
 tags; callers pin a tag or SHA, and rollback means repinning the previous one.
 
+## [0.2.2] — 2026-08-22
+
+Supply-chain hardening. Closes the 6 HIGH findings the framework raised against
+its own workflows during runner validation.
+
+### Fixed — third-party actions pinned to immutable commit SHAs
+
+Semgrep rule `yaml.github-actions.security.github-actions-mutable-action-tag`
+flagged 6 HIGH findings: every `actions/*` reference used a mutable major tag.
+A tag can be silently repointed at different code; a SHA cannot.
+
+| Action | Was | Now | Release |
+|---|---|---|---|
+| `actions/checkout` | `@v4` | `@11d5960a326750d5838078e36cf38b85af677262` | v4.4.0 |
+| `actions/setup-python` | `@v5` | `@a26af69be951a213d495a4c3e4e4022e16d87065` | v5.6.0 |
+| `actions/upload-artifact` | `@v4` | `@ea165f8d65b6e75b540449e92b4886f43607fa02` | v4.6.2 |
+
+Each SHA was resolved from the action's own repository, confirmed to be a real
+commit there, and cross-checked against the precise semver tag pointing at it.
+No SHA was guessed. Major versions are unchanged, so runtime behaviour is
+identical.
+
+`docs/ARCHITECTURE.md` no longer describes this as a known gap and now documents
+the verification procedure for re-resolving a pin.
+
 ## [0.2.1] — 2026-08-22
 
 Fixes from the first real GitHub Actions runner validation. One of them is a

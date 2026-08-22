@@ -167,20 +167,33 @@ ZAP `evidence` and Nuclei `extracted-results` response echoes are dropped.
 
 ## Supply chain
 
-Third-party actions in this repository are currently referenced by version tag,
-**not** by SHA. This is a known gap; pin before treating the workflows as
-production-hardened:
+Every third-party action is pinned to an **immutable full 40-character commit
+SHA**. A tag can be silently repointed at different code; a SHA cannot.
+
+| Action | Pinned SHA | Release |
+|---|---|---|
+| `actions/checkout` | `11d5960a326750d5838078e36cf38b85af677262` | v4.4.0 |
+| `actions/setup-python` | `a26af69be951a213d495a4c3e4e4022e16d87065` | v5.6.0 |
+| `actions/upload-artifact` | `ea165f8d65b6e75b540449e92b4886f43607fa02` | v4.6.2 |
+
+The trailing `# vX.Y.Z` comment on each `uses:` line records which release the SHA
+corresponds to, so the pin stays readable and auditable.
+
+To re-resolve or update a pin, resolve the tag and confirm the SHA is a real
+commit in that repository before using it:
 
 ```bash
-gh api repos/actions/checkout/git/ref/tags/v4      --jq .object.sha
-gh api repos/actions/setup-python/git/ref/tags/v5  --jq .object.sha
-gh api repos/actions/upload-artifact/git/ref/tags/v4 --jq .object.sha
-# then: uses: actions/checkout@<sha>  # v4
+gh api repos/actions/checkout/git/ref/tags/v4 --jq .object.sha
+gh api repos/actions/checkout/commits/<sha> --jq .commit.message   # must exist
+gh api "repos/actions/checkout/tags?per_page=100"   --jq '.[] | select(.commit.sha=="<sha>") | .name'                # which release
 ```
 
-The framework itself is pinned correctly: callers reference a tag or SHA, and the
-reusable workflow checks out framework code at `github.job_workflow_sha`, so the
-workflow definition and the code that runs can never drift apart.
+Never pin a SHA that has not been verified to exist in the action's own
+repository.
+
+The framework itself is pinned the same way: callers reference a tag or SHA, and
+the reusable workflow checks out framework code at `github.job_workflow_sha`, so
+the workflow definition and the code that runs can never drift apart.
 
 ## Rollback
 
