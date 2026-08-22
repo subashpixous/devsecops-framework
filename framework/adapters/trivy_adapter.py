@@ -52,7 +52,24 @@ class TrivyAdapter(Adapter):
         category_key = result.category_key
         sections = payload.get("Results")
         if sections is None:
-            result.fail("Trivy payload contains no 'Results' array; output cannot be trusted.")
+            # Trivy OMITS "Results" entirely when a scan completes with nothing to
+            # report -- for example a pip project whose requirements are unpinned
+            # ranges, so no concrete package version can be resolved. That is a
+            # completed scan with zero findings, not untrustworthy output, and it
+            # must not be reported as a broken tool.
+            #
+            # A genuine trivy report always carries SchemaVersion. Its absence
+            # means the payload is not a trivy report at all, which IS a failure.
+            if "SchemaVersion" not in payload:
+                result.fail(
+                    "Trivy payload is not a recognisable report (no SchemaVersion); "
+                    "output cannot be trusted."
+                )
+                return []
+            # Zero findings. The collector has already recorded a PARTIAL warning
+            # explaining that nothing was recognised, so the category still
+            # resolves to NOT_VERIFIED rather than PASS -- nothing was actually
+            # covered, and that must not read as clean.
             return []
 
         # SBOM mode is an artifact producer, not a finding producer.

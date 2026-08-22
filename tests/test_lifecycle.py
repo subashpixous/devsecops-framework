@@ -13,7 +13,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,8 +31,13 @@ from framework.core.lifecycle import (  # noqa: E402
 )
 from framework.core.schema import Finding  # noqa: E402
 
-FUTURE = (date.today() + timedelta(days=90)).isoformat()
-PAST = (date.today() - timedelta(days=1)).isoformat()
+# Expiry is evaluated against the UTC calendar, deterministically and
+# independently of where CI runs. These fixtures must use the SAME calendar:
+# building them from date.today() makes the suite fail whenever the local
+# calendar is ahead of UTC, because yesterday-local is still today-UTC.
+_UTC_TODAY = datetime.now(timezone.utc).date()
+FUTURE = (_UTC_TODAY + timedelta(days=90)).isoformat()
+PAST = (_UTC_TODAY - timedelta(days=2)).isoformat()
 
 
 def finding(description="Hard-coded credential", tool="semgrep", category="sast_finding",

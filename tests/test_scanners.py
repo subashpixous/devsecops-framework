@@ -206,7 +206,7 @@ class EmptyPayloadTestCase(unittest.TestCase):
         for adapter_cls, category, payload in (
             (SemgrepAdapter, "sast_semgrep", {"errors": []}),
             (GitleaksAdapter, "secret_scanning", {"_tool": "gitleaks"}),
-            (TrivyAdapter, "sca_dependencies", {"_mode": "fs-vuln"}),
+            (TrivyAdapter, "sca_dependencies", {"_mode": "fs-vuln"}),  # no SchemaVersion -> real failure
             (CheckovAdapter, "iac_scanning", {"passed_count": 3}),
             (ZapAdapter, "dast_zap", {"_target": "x"}),
             (NucleiAdapter, "nuclei_templates", {"_target": "x"}),
@@ -254,6 +254,26 @@ class AdapterOutputTestCase(unittest.TestCase):
         self.assertEqual(findings[0].category, "dependency_vulnerability")
         self.assertIn("CWE-77", findings[0].cwe)
         self.assertIn("4.17.21", findings[0].remediation)
+
+    def test_trivy_omitted_results_with_valid_report_is_zero_findings_not_failure(self):
+        """Trivy omits "Results" when a completed scan has nothing to report.
+
+        Observed on a real GitHub runner: a pip project with unpinned requirement
+        ranges yields rc=0, SchemaVersion 2, and no Results key. That is a clean
+        completed scan, not a broken tool -- but the collector's PARTIAL warning
+        still keeps the category at NOT_VERIFIED, because nothing was covered.
+        """
+        payload = {"_mode": "fs-vuln", "SchemaVersion": 2, "ArtifactType": "repository",
+                   "ArtifactName": "/src"}
+        result = result_for("sca_dependencies", payload)
+        findings = TrivyAdapter().normalize(result, CTX)
+        self.assertEqual(findings, [])
+        self.assertNotEqual(result.status, "FAILED")   # tool worked; do not blame it
+
+    def test_trivy_payload_without_schemaversion_is_a_real_failure(self):
+        result = result_for("sca_dependencies", {"_mode": "fs-vuln", "junk": True})
+        TrivyAdapter().normalize(result, CTX)
+        self.assertEqual(result.status, "FAILED")
 
     def test_trivy_sbom_emits_artifact_not_findings(self):
         payload = {"_mode": "sbom", "component_count": 120, "Results": []}
