@@ -129,12 +129,27 @@ def normalise_severity(value: Optional[str]) -> str:
     return mapping.get(token, SEVERITY_UNKNOWN)
 
 
-def compute_fingerprint(tool: str, rule: str, file_path: str, category: str, description: str) -> str:
-    """Stable identity for a finding across runs.
+def compute_fingerprint(
+    tool: str,
+    rule: str,
+    file_path: str,
+    category: str,
+    description: str,
+    discriminator: str = "",
+) -> str:
+    """Stable identity for ONE finding across runs.
 
-    Line number is deliberately excluded: unrelated edits shift lines and would
-    otherwise churn every fingerprint, breaking the Phase 4 lifecycle/exception
-    model before it is built.
+    `discriminator` distinguishes independent occurrences that share every other
+    attribute. Without it, five different secrets on five different lines of the
+    same file, found by the same rule, collapse into one identity -- and a single
+    exception entry would then suppress all five.
+
+    That was the original design: line number was excluded so unrelated edits
+    could not churn fingerprints and disturb the lifecycle model. Measured
+    against a real project the trade was wrong -- 83 of 156 findings shared an
+    identity across 21 groups. Churn costs accuracy in the NEW/EXISTING split;
+    collision silently hides real findings. Only one of those is a safety
+    property, so uniqueness wins and the churn is accepted.
     """
     normalised_description = _WHITESPACE.sub(" ", (description or "").strip().lower())
     seed = "|".join(
@@ -144,9 +159,29 @@ def compute_fingerprint(tool: str, rule: str, file_path: str, category: str, des
             (file_path or "").strip().replace("\\", "/").lower(),
             (category or "").strip().lower(),
             normalised_description,
+            (discriminator or "").strip().lower(),
         ]
     )
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+def occurrence_discriminator(native_id: str, line: Any, component: str) -> str:
+    """The parts that tell two otherwise-identical findings apart.
+
+    All three are needed, and each earns its place against real scanner output:
+
+      native_id  the tool's own identity, unique per occurrence for some tools
+      line       position in a file -- separates repeated hits of one rule
+      component  the affected thing -- separates one CVE affecting two packages,
+                 which share a file, a line (0) and a native id
+    """
+    return "|".join(
+        [
+            (native_id or "").strip(),
+            str(line or 0).strip(),
+            (component or "").strip(),
+        ]
+    )
 
 
 @dataclass
@@ -194,7 +229,12 @@ class Finding:
         self.severity = normalise_severity(self.severity or self.raw_severity)
         if not self.fingerprint:
             self.fingerprint = compute_fingerprint(
-                self.tool, self.rule, self.file, self.category, self.description
+                self.tool,
+                self.rule,
+                self.file,
+                self.category,
+                self.description,
+                occurrence_discriminator(self.native_id, self.line, self.component),
             )
         stamp = utc_now()
         if not self.first_seen:

@@ -149,6 +149,123 @@ class CheckovSecretHygieneTestCase(unittest.TestCase):
         self.assertNotIn("hunter2", blob)
 
 
+class FingerprintCollisionTestCase(unittest.TestCase):
+    """One exception must never suppress several independent findings.
+
+    Measured on a real project, 83 of 156 findings shared an identity across 21
+    groups, so a single exception entry would have silenced up to 11 unrelated
+    findings at once.
+    """
+
+    def finding(self, **kw):
+        from framework.core.schema import Finding
+
+        base = dict(
+            tool="gitleaks", rule="generic-api-key", file="appsettings.json",
+            category="secret", description="Detected a Generic API Key",
+            severity="CRITICAL", native_id="", line=0, component="",
+        )
+        base.update(kw)
+        return Finding(**base)
+
+    def test_same_rule_on_different_lines_of_one_file_are_distinct(self):
+        a = self.finding(line=10)
+        b = self.finding(line=40)
+        c = self.finding(line=116)
+        self.assertEqual(len({a.fingerprint, b.fingerprint, c.fingerprint}), 3)
+
+    def test_one_cve_affecting_two_packages_is_two_findings(self):
+        # Same file, same line (0), same native id -- only the component differs.
+        a = self.finding(tool="trivy", rule="CVE-2026-22610", category="dependency_vulnerability",
+                         file="package-lock.json", native_id="CVE-2026-22610",
+                         component="@angular/compiler@16.2.12")
+        b = self.finding(tool="trivy", rule="CVE-2026-22610", category="dependency_vulnerability",
+                         file="package-lock.json", native_id="CVE-2026-22610",
+                         component="@angular/core@16.2.12")
+        self.assertNotEqual(a.fingerprint, b.fingerprint)
+
+    def test_repeated_rule_hits_in_one_file_are_distinct(self):
+        a = self.finding(tool="semgrep", rule="csharp-sqli", category="sast_finding",
+                         file="MySqlHelper.cs", line=135)
+        b = self.finding(tool="semgrep", rule="csharp-sqli", category="sast_finding",
+                         file="MySqlHelper.cs", line=185)
+        self.assertNotEqual(a.fingerprint, b.fingerprint)
+
+    def test_the_same_finding_is_still_stable_across_runs(self):
+        # Uniqueness must not cost idempotence: identical input, identical id.
+        a = self.finding(line=10, native_id="n1", component="c1")
+        b = self.finding(line=10, native_id="n1", component="c1")
+        self.assertEqual(a.fingerprint, b.fingerprint)
+
+    def test_description_normalisation_still_applies(self):
+        a = self.finding(description="Hard-coded password", line=1)
+        b = self.finding(description="  hard-coded   PASSWORD ", line=1)
+        self.assertEqual(a.fingerprint, b.fingerprint)
+
+    def test_line_type_does_not_change_identity(self):
+        self.assertEqual(self.finding(line=10).fingerprint,
+                         self.finding(line="10").fingerprint)
+
+    def test_checkov_secret_native_id_is_per_occurrence_not_per_rule(self):
+        payload = {"failed_checks": [
+            check("CKV_SECRET_6", "/appsettings.json", resource="a" * 40, file_line_range=[10, 11]),
+            check("CKV_SECRET_6", "/appsettings.json", resource="b" * 40, file_line_range=[40, 41]),
+        ]}
+        f1, f2 = CheckovSecretsAdapter().normalize(result_for("secret_scanning", payload), CTX)
+        self.assertNotEqual(f1.native_id, f2.native_id)
+        self.assertNotEqual(f1.fingerprint, f2.fingerprint)
+
+    def test_checkov_dockerfile_native_id_is_per_occurrence(self):
+        payload = {"failed_checks": [
+            check("CKV_DOCKER_3", "/API/Dockerfile"),
+            check("CKV_DOCKER_3", "/UI/Dockerfile"),
+        ]}
+        f1, f2 = CheckovDockerfileAdapter().normalize(
+            result_for("container_hardening", payload), CTX)
+        self.assertNotEqual(f1.fingerprint, f2.fingerprint)
+
+
+class ExceptionCannotCollideTestCase(unittest.TestCase):
+    """The consequence the collision actually had: over-suppression.
+
+    Before the fix, one exception for `generic-api-key` in `appsettings.DEV.json`
+    would have suppressed five different credentials in that file.
+    """
+
+    def secrets_in_one_file(self, lines):
+        from framework.core.schema import Finding
+
+        return [
+            Finding(
+                tool="gitleaks", rule="generic-api-key", file="appsettings.DEV.json",
+                category="secret", description="Detected a Generic API Key",
+                severity="CRITICAL", line=ln,
+                native_id="c0ffee:appsettings.DEV.json:generic-api-key:%d" % ln,
+            )
+            for ln in lines
+        ]
+
+    def test_an_exception_suppresses_exactly_one_finding(self):
+        from framework.core.lifecycle import Exception_, apply_lifecycle, is_suppressed
+
+        findings = self.secrets_in_one_file([10, 40, 116, 118, 120])
+        self.assertEqual(len({f.fingerprint for f in findings}), 5, "fingerprints collided")
+
+        target = findings[2]
+        exceptions = {
+            target.fingerprint: Exception_(
+                target.fingerprint, "accepted_risk",
+                reason="reviewed", expires="2999-01-01",
+            )
+        }
+        apply_lifecycle(findings, {}, "", exceptions, "exc.yml", {"secret_scanning"})
+
+        suppressed = [f for f in findings if is_suppressed(f)]
+        self.assertEqual(len(suppressed), 1)
+        self.assertEqual(suppressed[0].line, 116)
+        self.assertEqual(len([f for f in findings if not is_suppressed(f)]), 4)
+
+
 class SemgrepErrorClassificationTestCase(unittest.TestCase):
     def parse_error(self, path):
         return {"type": "Syntax error", "level": "warn",

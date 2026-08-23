@@ -70,13 +70,44 @@ Two interlocks keep this fail-closed, and no rule was disabled to achieve it:
 without setting `degraded`. `partial()`, `fail()` and `skip()` are unchanged and
 still degrade.
 
+### Fixed - fingerprints collided, so one exception suppressed many findings
+
+`compute_fingerprint` hashed tool + rule + file + category + description and
+deliberately excluded position, so unrelated edits could not churn identities.
+Measured against a real project that trade was wrong: **83 of 156 findings shared
+an identity across 21 groups.** Five different credentials on five different lines
+of one file collapsed into one id, so a single `accepted_risk` entry would have
+suppressed all five - and the largest group was 11.
+
+Fingerprints now include an occurrence discriminator built from `native_id`,
+`line` and `component`. All three are needed against real output: `line`
+separates repeated hits of one rule, and `component` separates one CVE affecting
+two packages, which share a file, a line of 0 and a native id.
+
+Checkov had no per-occurrence id at all - `native_id` was the check id, which
+repeats for every hit. For a secret check it is now Checkov's hash of the matched
+value, which identifies the occurrence and survives the line moving; otherwise it
+falls back to `check_id:path:line`.
+
+Replaying the real 156-finding dataset through the new scheme: **156 unique
+fingerprints, 0 collisions**, down from 94 unique / 83 colliding.
+
+The churn this originally avoided is accepted. Churn costs accuracy in the
+NEW/EXISTING split; collision silently hides real findings. Only one of those is a
+safety property.
+
 ### Tests
 
-148, up from 126. `tests/test_routing.py` covers routing per concern, that no
+157, up from 126. `tests/test_routing.py` covers routing per concern, that no
 finding is dropped, that a secret's component is never its value hash, Checkov
 secret stripping and adapter refusal, error classification including the
 unattributable-error case, and the collector's degradation matrix - notably that a
-parse gap with findings stays OK while a parse gap with none fails closed.
+parse gap with findings stays OK while a parse gap with none fails closed. It
+also covers fingerprint uniqueness, stability under repeat runs, and the property
+that motivated the fix: an exception targeting one finding suppresses exactly one.
+
+A new CI guard asserts independent findings receive independent fingerprints, so
+the collision cannot regress.
 
 ## [0.2.2] — 2026-08-22
 

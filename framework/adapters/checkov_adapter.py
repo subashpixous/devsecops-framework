@@ -133,7 +133,14 @@ class CheckovAdapter(Adapter):
                 impact=impact,
                 remediation=guideline or fallback,
                 rule=check_id,
-                native_id=str(check_id or ""),
+                # Checkov has no per-occurrence id of its own: `check_id` is the
+                # rule, so it repeats for every hit. For a secret check `resource`
+                # is a hash of the matched value, which identifies the occurrence
+                # and survives the line moving; otherwise fall back to position.
+                native_id=(
+                    str(resource) if (is_secret and resource)
+                    else "%s:%s:%s" % (check_id, path, line)
+                ),
                 # A secret's component is the file that carries it. Using Checkov's
                 # value-hash there would make every finding look like a distinct
                 # component and hide which files are affected.

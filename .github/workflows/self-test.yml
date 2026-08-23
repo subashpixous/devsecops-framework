@@ -96,6 +96,31 @@ jobs:
           print("OK: %d scanners registered, all resolvable." % len(scanners))
           PY
 
+      - name: Verify fingerprints do not collide across independent findings
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from framework.core.schema import Finding
+
+          def f(**kw):
+              base = dict(tool="t", rule="r", file="f.json", category="secret",
+                          description="d", severity="HIGH", native_id="", line=0, component="")
+              base.update(kw)
+              return Finding(**base)
+
+          # Same rule, same file, different positions -> must be distinct findings.
+          lines = [f(line=n) for n in (10, 40, 116, 118)]
+          assert len({x.fingerprint for x in lines}) == 4, "line collision"
+
+          # One CVE affecting two packages: same file, same line, same native id.
+          pkgs = [f(native_id="CVE-1", component="a@1"), f(native_id="CVE-1", component="b@2")]
+          assert len({x.fingerprint for x in pkgs}) == 2, "component collision"
+
+          # Uniqueness must not cost idempotence.
+          assert f(line=5, native_id="n", component="c").fingerprint ==                  f(line=5, native_id="n", component="c").fingerprint, "not stable"
+          print("OK: independent findings receive independent fingerprints.")
+          PY
+
       - name: Verify every category is covered or explicitly framework-internal
         run: |
           set -euo pipefail
