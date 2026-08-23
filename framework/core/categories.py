@@ -141,6 +141,18 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
         description="Misconfiguration in Terraform / CloudFormation / ARM templates.",
     ),
     SecurityCategory(
+        key="container_hardening",
+        stage=STAGE_PRE_BUILD,
+        title="Container Build Hardening",
+        phase=2,
+        applies_when="docker",
+        tools=("checkov",),
+        description=(
+            "Misconfiguration in container build definitions: privilege, healthcheck and "
+            "build-time hygiene. Read from source, so it needs no built image."
+        ),
+    ),
+    SecurityCategory(
         key="api_spec_security",
         stage=STAGE_PRE_BUILD,
         title="API Specification Security",

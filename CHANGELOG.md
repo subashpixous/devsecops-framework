@@ -3,6 +3,81 @@
 All notable changes to this framework are recorded here. Releases are immutable
 tags; callers pin a tag or SHA, and rollback means repinning the previous one.
 
+## [0.3.0] - 2026-08-23
+
+Findings that were reported but carried no verdict weight now count. Both fixes
+came from the first real run against a consumer project.
+
+### Fixed - Checkov filed every finding under Infrastructure-as-Code
+
+Checkov covers three different concerns, and all three were adapted into
+`iac_scanning`. That category is `NOT_APPLICABLE` on a project with no IaC, so on
+the validation project **26 findings were reported and none of them gated**:
+
+| Rule | Count | What it actually is |
+|---|---|---|
+| `CKV_SECRET_6` | 22 | committed secrets, not IaC |
+| `CKV_DOCKER_3` | 2 | container runs as root |
+| `CKV_DOCKER_2` | 2 | no HEALTHCHECK |
+
+All 26 also carried `severity: UNKNOWN`, and the policy threshold for UNKNOWN is
+0 - so routed correctly they would have forced a FAILED verdict on their own.
+
+Checkov is now scanned once per concern, each scoped with `--framework` and each
+registered to the category that owns it:
+
+    checkov-iac         -> iac_scanning
+    checkov-secrets     -> secret_scanning
+    checkov-dockerfile  -> container_hardening   (new category)
+
+`container_hardening` is a new PRE_BUILD category, applicable when the project has
+a Dockerfile. It reads build definitions from source, so it needs no built image -
+which is why container root-user findings previously had nowhere applicable to go.
+
+Severity, evidence and line numbers are preserved, and **no finding is dropped by
+the routing**. A secret finding's `component` is now the file that carries it
+rather than Checkov's hash of the matched value, which had made every secret look
+like a distinct component and hid which files were affected.
+
+Secret hygiene extends to Checkov: `code_block`, `fixed_definition`, `details` and
+`evaluations` are stripped at collection, and the adapter refuses any record still
+carrying them - the same two-layer contract Gitleaks already had.
+
+### Fixed - one unparseable file silenced an entire SAST category
+
+Semgrep reports rule failures and per-file parse failures in the same `errors`
+array. The collector treated both as lost coverage, so 5 unparseable files pushed
+`sast_semgrep` to `NOT_VERIFIED` and **48 real findings, 11 of them HIGH, stopped
+gating.**
+
+Root cause: Semgrep's generic HTML and JSON grammars cannot parse Angular template
+dialect - interpolation such as `{{ counter < 10 ? '0' + counter : counter }}`,
+bare `&`, and `&&` inside bindings. These are parser limitations on 5 files, not
+rule failures, and every other file scanned normally.
+
+Errors are now classified. A blocking error still degrades the result. A parse
+error that **names the file it could not read** is recorded as a bounded coverage
+gap: that file was not analysed, the rest of the scan stands, and the gap travels
+into the report as a limitation.
+
+Two interlocks keep this fail-closed, and no rule was disabled to achieve it:
+
+* An error that does not name a file bounds nothing, so it is treated as blocking.
+* A bounded gap **plus zero findings** degrades anyway - "clean" cannot be trusted
+  while files went unread.
+
+`ScannerResult.warn()` was added for this: a caveat that is recorded and reported
+without setting `degraded`. `partial()`, `fail()` and `skip()` are unchanged and
+still degrade.
+
+### Tests
+
+148, up from 126. `tests/test_routing.py` covers routing per concern, that no
+finding is dropped, that a secret's component is never its value hash, Checkov
+secret stripping and adapter refusal, error classification including the
+unattributable-error case, and the collector's degradation matrix - notably that a
+parse gap with findings stays OK while a parse gap with none fails closed.
+
 ## [0.2.2] — 2026-08-22
 
 Supply-chain hardening. Closes the 6 HIGH findings the framework raised against

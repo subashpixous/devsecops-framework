@@ -70,6 +70,21 @@ class ScannerResult:
         self.warnings.append(message)
         return self
 
+    def warn(self, message: str) -> "ScannerResult":
+        """Record a caveat that does NOT invalidate the scan.
+
+        Distinct from partial(): this is for a limitation the scan itself reports
+        and survives -- for example named files a parser could not read while the
+        rest of the run completed normally. The warning travels into the report so
+        the gap is visible, but coverage is not claimed to be lost wholesale.
+
+        A collector must use partial() instead whenever the caveat means the
+        result can no longer be trusted, including when a "clean" outcome could be
+        an artefact of the gap.
+        """
+        self.warnings.append(message)
+        return self
+
     def succeed(self) -> "ScannerResult":
         """Promote to OK -- but never over a degradation already recorded.
 

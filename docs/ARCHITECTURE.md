@@ -46,7 +46,7 @@ the inputs each stage needs appear at different points in a delivery pipeline:
 
 | Stage | Needs | Categories |
 |---|---|---|
-| `PRE_BUILD` | source only | SonarQube, Semgrep, Gitleaks, Trivy SCA, Checkov, 42Crunch |
+| `PRE_BUILD` | source only | SonarQube, Semgrep, Gitleaks, Trivy SCA, Checkov (IaC / secrets / dockerfile), 42Crunch |
 | `POST_BUILD` | a built artifact | Trivy image, SBOM, bundle scanner, cosign, Trivy k8s |
 | `AGGREGATION` | findings from this run | finding lifecycle |
 | `POST_DEPLOY` | a live URL | ZAP, Nuclei, runtime probes |
@@ -145,6 +145,50 @@ Adding a scanner never changes the engine:
 
 The category already exists and is already being reported as `NOT_IMPLEMENTED`,
 so the change is additive by construction.
+
+## Finding routing
+
+A scanner that covers several concerns must not file every finding under one
+category. The category decides whether a finding carries verdict weight, so a
+misfiled finding can be reported and still count for nothing -- for example a
+committed secret filed under Infrastructure-as-Code on a project that has no IaC,
+where the category is `NOT_APPLICABLE`.
+
+The rule: **a finding belongs to the category that owns its concern, not to the
+tool that happened to find it.** Where a tool can be scoped, each concern gets its
+own scan, its own `ScannerResult` and its own category:
+
+| Tool | Scope | Category |
+|---|---|---|
+| `checkov-iac` | `--framework <iac>` | `iac_scanning` |
+| `checkov-secrets` | `--framework secrets` | `secret_scanning` |
+| `checkov-dockerfile` | `--framework dockerfile` | `container_hardening` |
+| `trivy-sca` / `-image` / `-sbom` / `-k8s` | subcommand | four categories |
+
+The engine keys scanner results by `result.category_key` and findings by
+`finding.scanner_category`, so the two travel independently and a finding always
+lands where it counts.
+
+## Scanner degradation vs coverage gaps
+
+`ScannerResult` distinguishes two things a scan can report about itself:
+
+* `partial()` / `fail()` / `skip()` set `degraded`, and the category becomes
+  `NOT_VERIFIED`. Use these whenever the result can no longer be trusted.
+* `warn()` records a **bounded, named** caveat without degrading -- for example
+  specific files a parser could not read while the rest of the scan completed.
+
+The distinction exists because collapsing the two discards real findings: one
+unparseable template would push an entire SAST category to `NOT_VERIFIED`, so
+every genuine finding stopped gating. A bounded gap is reported as a limitation
+instead.
+
+Two rules keep this fail-closed:
+
+* An unattributable error -- one that does not name what it could not read --
+  is always treated as blocking, never as a bounded gap.
+* A bounded gap **plus zero findings** degrades anyway. "Clean" cannot be trusted
+  while files went unread.
 
 ## Secret hygiene
 
