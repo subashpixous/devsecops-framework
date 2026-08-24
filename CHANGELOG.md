@@ -3,6 +3,171 @@
 All notable changes to this framework are recorded here. Releases are immutable
 tags; callers pin a tag or SHA, and rollback means repinning the previous one.
 
+## [0.4.0] - 2026-08-24
+
+File-level coverage, two categories for what code scanners cannot see, and
+findings delivered where developers actually work.
+
+Note: v0.3.0 was tagged but `VERSION` and `framework.__version__` were left at
+0.2.2. This release corrects them; reports from a 0.3.0 run understate their own
+framework version.
+
+### Fixed - the SCA scanner was excluded from the only directory it needed
+
+`SKIP_DIRS` in the Trivy collector and `EXCLUDES` in the Semgrep collector were
+two hard-coded lists that both contained `vendor`. For SAST that is a reasonable
+default. For SCA it is the defect:
+
+    vendor/          <- where composer, go mod and bundler put dependencies
+    node_modules/    <- where npm puts them
+
+A PHP or Go project with no committed lockfile keeps its ONLY inventory of
+installed third-party versions inside `vendor/`. Trivy was told to skip it, found
+no manifest anywhere else, and returned no `Results` section. The collector
+called that "no lockfile recognised" - a scan of nothing, reported as a scan.
+
+Path policy now lives in `framework/core/scanpaths.py` and is resolved from the
+caller's INTENT rather than a shared list:
+
+| Intent | Vendored dependency source | Why |
+|---|---|---|
+| `sca` | read | it is the dependency inventory |
+| `secret` | read | a credential is exposed wherever it sits |
+| `sast` | skipped, and declared | findings in uneditable code bury the rest |
+
+A skipped tree is never silent: `ExclusionPlan.coverage_note()` names the
+directory and the reason, and it travels into the report.
+
+`--include-dependencies` runs SAST over vendored source too. Either way the
+choice is recorded, so a result never has to be interpreted against an assumed
+default.
+
+### Fixed - Semgrep ran the ruleset that does not look for security defects
+
+The default was `p/default`, Semgrep's high-precision starter pack. It is tuned
+to almost never produce a false positive, which also means it does not ask most
+security questions. A category could reach PASS from a scan that never looked.
+
+The default is now `p/security-audit` + `p/owasp-top-ten`, plus a language pack
+for each language actually detected (`p/php`, `p/python`, ...). `SEMGREP_RULES`
+still overrides, and `config_source` on the result records which applied.
+
+### Fixed - a plain PHP application declared itself out of scope for DAST
+
+`backend` was inferred only from a framework signature (Laravel, Django, ...).
+A PHP application without one was `backend: false`, so `applies_when="deployable"`
+resolved every runtime category to NOT_APPLICABLE. An internet-facing application
+excused itself from runtime testing.
+
+PHP source has one execution mode: interpreted by a web server on request. A
+`.php` file in the tree now establishes `backend`.
+
+### Added - file-level coverage census
+
+The category model answers "which control ran". It cannot answer "was any of my
+code never looked at", because a scanner that completes over half a repository
+reports identically to one that read all of it.
+
+`framework/core/coverage.py` walks the workspace and puts every file in exactly
+one bucket, each with a reason:
+
+    analysed                  read by a scanner that completed
+    excluded_path             matched a declared exclusion (the pattern is named)
+    no_scanner_for_filetype   no engine here parses this type (.sql, .htaccess)
+    scanner_did_not_complete  the engine that reads it failed or was absent
+    not_code                  images, fonts, archives - data, not source
+
+Rules that keep the number honest:
+
+  * a scanner that FAILED or went PARTIAL is credited with nothing. Its files
+    surface as unanalysed rather than being attributed to a scan that never read
+    them;
+  * secret scanning does not count as analysis. Gitleaks reads every byte of a
+    PHP file and still says nothing about the injection in it. Its reach is
+    reported separately;
+  * an absent census reads as UNKNOWN, never as complete.
+
+Written to `final-report.json`, section 8.1 of `report.md` and section 7.3 of the
+PDF.
+
+### Added - `repo_hygiene` category
+
+What the repository DISCLOSES, as opposed to what its code does. Every other
+scanner reads these files as opaque data and reports nothing:
+
+  * runtime logs committed inside a web root, fetchable over HTTP;
+  * database dumps, archives and `.env` files served from the web root;
+  * private keys and credential files, reported by name without opening them;
+  * user-uploaded documents committed alongside the application;
+  * the missing `.gitignore` behind all of the above.
+
+Only TRACKED files are examined. An untracked file on a developer's disk is not
+an exposure, and inventing findings for build output is how a control gets
+switched off.
+
+Uploaded personal data is reported per directory and never per file. An upload
+filename can identify the person who submitted it, and these reports are
+downloadable artifacts. Static-asset paths (`assets/`, `static/`, ...) are
+excluded: a published guidelines PDF is shipped BY the project, not sent TO it.
+
+### Added - `web_server_config` category
+
+`.htaccess`, `nginx.conf` and `web.config` decide questions no application
+hardening can answer - whether the upload directory executes what it is given,
+whether directory listings are served, whether logs and dumps are denied. No SAST
+engine parses them.
+
+A MISSING deny rule is the finding: an upload directory with no configuration is
+the default-permissive case, and the default is what runs.
+
+### Added - SARIF output and code scanning upload
+
+`security.sarif` is written every run, and the reusable workflow uploads it via
+`github/codeql-action/upload-sarif`. Findings appear on their line in the pull
+request and in the Security tab instead of inside an artifact nobody downloads.
+
+  * `partialFingerprints` carries the framework fingerprint, so a finding stays
+    one alert across runs instead of re-raising on every reformat;
+  * `suppressions` carries FALSE_POSITIVE and ACCEPTED_RISK. EXPIRED is
+    deliberately absent - expiry exists to force the decision back into view;
+  * a finding with no file location is emitted against the repository root, never
+    dropped;
+  * incomplete category coverage and unanalysed files are emitted as
+    `toolExecutionNotifications`, so the file cannot be mistaken for a clean scan.
+
+The job now requests `security-events: write`. A caller that cannot grant it sets
+`upload_sarif: false`; the step is `continue-on-error`, because code scanning
+being unavailable is a delivery problem and must never become a security verdict.
+
+### Added - `findings.csv`
+
+The narrative reports truncate by design: 400 table rows and 60 detail entries in
+Markdown, 250 and 40 in the PDF. On a legacy codebase that is a small fraction of
+the findings, and no untruncated list existed in a format anyone opens.
+
+`findings.csv` has one row per finding, never truncated, sorted most-severe-first
+with NEW ahead of EXISTING inside each severity, and empty `owner`, `target_date`
+and `notes` columns. Written through the `csv` module, so a description
+containing a comma or a quote cannot shift the columns.
+
+`--max-table-rows` and `--max-detailed-findings` now raise the narrative limits.
+
+### Changed
+
+  * `active_phase` default is 7.
+  * `sensitive_data_exposure` added to `security_finding_categories`. It is kept
+    apart from `information_disclosure` because the remediations are unrelated:
+    one is fixed by moving a file, the other by rotating a secret.
+  * The detector reports `web_server_config_files`.
+  * `test_all_phases_are_active_by_default` asserts against the category registry
+    instead of a hard-coded 6, which failed for the one reason that is not a
+    defect.
+
+### Tests
+
+157 -> 255. New suites: `test_scanpaths.py`, `test_coverage.py`,
+`test_repo_hygiene.py`, `test_report_outputs.py`.
+
 ## [0.3.0] - 2026-08-23
 
 Findings that were reported but carried no verdict weight now count. Both fixes

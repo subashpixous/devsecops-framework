@@ -161,6 +161,36 @@ CATEGORY_REGISTRY: Tuple[SecurityCategory, ...] = (
         tools=("42crunch",),
         description="OpenAPI contract security audit.",
     ),
+    SecurityCategory(
+        key="repo_hygiene",
+        stage=STAGE_PRE_BUILD,
+        title="Repository Hygiene & Data Exposure",
+        phase=7,
+        applies_when="always",
+        tools=("repo-hygiene",),
+        description=(
+            "What the repository itself discloses, as distinct from what its code does: "
+            "runtime logs and database dumps committed under a web root, uploaded user "
+            "documents committed alongside the application, and the absence of the ignore "
+            "rules that would have prevented either. A code scanner reads these files as "
+            "data and reports nothing, so without this category they are invisible to "
+            "every other control."
+        ),
+    ),
+    SecurityCategory(
+        key="web_server_config",
+        stage=STAGE_PRE_BUILD,
+        title="Web Server Configuration",
+        phase=7,
+        applies_when="web_server_config",
+        tools=("web-config",),
+        description=(
+            "Directives in committed Apache/nginx/IIS configuration that decide whether "
+            "upload directories execute code, whether directory listings are served and "
+            "whether sensitive files are reachable. These files govern the application's "
+            "exposed surface and are not source code, so no SAST engine reads them."
+        ),
+    ),
     # --- POST-BUILD ---
     SecurityCategory(
         key="container_image",
@@ -341,6 +371,22 @@ def evaluate_applicability(
     if rule == "frontend":
         value = bool(capabilities.get("frontend"))
         return value, "frontend=%s" % value, None
+
+    if rule == "web_server_config":
+        files = capabilities.get("web_server_config_files") or []
+        value = bool(files)
+        note = None
+        if not value and capabilities.get("backend"):
+            # A server-side application is served by SOMETHING. No committed
+            # config means the directives that decide its exposed surface live
+            # somewhere this scan cannot see, which is a gap worth recording --
+            # not a reason to call the category inapplicable and move on.
+            note = (
+                "No web server configuration is committed, but this project is served by "
+                "one. Its directives are managed outside the repository and were therefore "
+                "not reviewed."
+            )
+        return value, "web_server_config_files=%d" % len(files), note
 
     if rule == "package_manager":
         value = bool(capabilities.get("package_manager"))

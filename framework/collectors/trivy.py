@@ -20,6 +20,7 @@ import os
 import tempfile
 from typing import Any, Dict, List, Optional
 
+from ..core import scanpaths
 from ..core.registry import ScannerRegistration, register_scanner
 from ..core.toolrunner import accepted, run, tool_available, tool_version
 from .base import Collector, ScannerResult
@@ -33,7 +34,25 @@ CATEGORY_IMAGE = "container_image"
 CATEGORY_SBOM = "sbom"
 CATEGORY_K8S = "kubernetes_security"
 
-SKIP_DIRS = "node_modules,dist,build,.git,.angular,.next,vendor,.venv,venv,__pycache__,bin,obj,target"
+# Trivy is the SCA engine, so it must READ vendored dependency directories --
+# for PHP (`vendor/`) and Go with no committed lockfile, that tree is the only
+# record of which third-party versions are actually installed. Excluding it, as
+# a shared SAST-style skip list did, made every such project report "no
+# lockfile recognised" and resolve to a clean dependency scan of nothing.
+#
+# Misconfiguration scanning (Kubernetes manifests) has the opposite need and
+# resolves its own SAST-intent plan.
+def sca_exclusions(languages=()):
+    return scanpaths.resolve(scanpaths.INTENT_SCA, languages)
+
+
+def misconfig_exclusions(languages=()):
+    return scanpaths.resolve(scanpaths.INTENT_SAST, languages)
+
+
+def skip_dirs_arg(plan) -> str:
+    """Trivy takes one comma-separated --skip-dirs value."""
+    return ",".join(plan.patterns)
 
 
 class _TrivyBase(Collector):
@@ -41,9 +60,15 @@ class _TrivyBase(Collector):
 
     tool = TOOL
 
-    def __init__(self, workspace: str = ".", timeout: int = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        workspace: str = ".",
+        timeout: int = DEFAULT_TIMEOUT,
+        languages: Optional[List[str]] = None,
+    ) -> None:
         self.workspace = workspace
         self.timeout = timeout
+        self.languages = list(languages or ())
 
     def _guard(self, result: ScannerResult, what: str) -> Optional[ScannerResult]:
         if not tool_available(TOOL):
@@ -78,6 +103,9 @@ class TrivyScaCollector(_TrivyBase):
 
     def collect(self) -> ScannerResult:
         result = self.new_result()
+        plan = sca_exclusions(self.languages)
+        result.metadata["exclusions"] = plan.to_dict()
+        result.metadata["coverage"] = {"exclusions": plan.to_dict(), "extensions": []}
         guard = self._guard(result, "Dependency scanning")
         if guard:
             return guard
@@ -87,7 +115,7 @@ class TrivyScaCollector(_TrivyBase):
             "--scanners", "vuln",
             "--format", "json",
             "--quiet",
-            "--skip-dirs", SKIP_DIRS,
+            "--skip-dirs", skip_dirs_arg(plan),
             self.workspace,
         ]
         payload = self._run_json(result, argv)
@@ -96,8 +124,11 @@ class TrivyScaCollector(_TrivyBase):
 
         if "Results" not in payload:
             result.partial(
-                "Trivy returned no 'Results' section. This normally means no lockfile or "
-                "manifest was recognised; dependency coverage may be incomplete."
+                "Trivy returned no 'Results' section. No lockfile, manifest or vendored "
+                "package metadata was recognised anywhere under %s, so NO dependency "
+                "inventory exists for this project and its dependency risk is unknown. "
+                "This is not a clean dependency scan."
+                % (", ".join(plan.vendored_scanned) or "the workspace")
             )
         payload["_mode"] = "fs-vuln"
         result.payload = payload
@@ -252,6 +283,8 @@ class TrivyKubernetesCollector(_TrivyBase):
 
     def collect(self) -> ScannerResult:
         result = self.new_result()
+        plan = misconfig_exclusions(self.languages)
+        result.metadata["exclusions"] = plan.to_dict()
         guard = self._guard(result, "Kubernetes manifest scanning")
         if guard:
             return guard
@@ -260,7 +293,7 @@ class TrivyKubernetesCollector(_TrivyBase):
             TOOL, "config",
             "--format", "json",
             "--quiet",
-            "--skip-dirs", SKIP_DIRS,
+            "--skip-dirs", skip_dirs_arg(plan),
             self.workspace,
         ]
         payload = self._run_json(result, argv)
@@ -274,10 +307,10 @@ class TrivyKubernetesCollector(_TrivyBase):
 
 # Each collector declares exactly which kwargs it accepts, so the shared kwarg
 # bag passed by the pipeline can grow without breaking any single collector.
-TrivyScaCollector.ACCEPTS = {"workspace", "timeout"}
+TrivyScaCollector.ACCEPTS = {"workspace", "timeout", "languages"}
 TrivyImageCollector.ACCEPTS = {"workspace", "timeout", "images"}
 TrivySbomCollector.ACCEPTS = {"workspace", "timeout", "images", "output_dir"}
-TrivyKubernetesCollector.ACCEPTS = {"workspace", "timeout"}
+TrivyKubernetesCollector.ACCEPTS = {"workspace", "timeout", "languages"}
 
 
 def _factory(cls):

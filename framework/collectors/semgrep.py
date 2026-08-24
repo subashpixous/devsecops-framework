@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
+from ..core import scanpaths
 from ..core.registry import ScannerRegistration, register_scanner
 from ..core.toolrunner import accepted, run, tool_available, tool_version
 from .base import Collector, ScannerResult
@@ -23,13 +24,52 @@ CATEGORY_KEY = "sast_semgrep"
 # 0 = clean, 1 = findings present. Both mean the scan completed.
 ACCEPT_RC = (0, 1)
 
-DEFAULT_CONFIG = "p/default"
+# `p/default` is Semgrep's high-precision starter set: it is tuned to almost
+# never produce a false positive, which also means it does not look for most of
+# what a security review needs. Running it and calling the category PASS would
+# be a clean result from a scan that was never asked the security questions.
+#
+# The security packs below are the ones whose whole purpose is those questions.
+# A project that wants something else sets SEMGREP_RULES and the choice is
+# recorded on the result either way.
+SECURITY_CONFIGS = ("p/security-audit", "p/owasp-top-ten")
+
+# Language packs, added only for languages actually present. Semgrep accepts
+# repeated --config flags and unions the rules.
+LANGUAGE_CONFIGS = {
+    "php": "p/php",
+    "python": "p/python",
+    "javascript": "p/javascript",
+    "typescript": "p/typescript",
+    "java": "p/java",
+    "go": "p/golang",
+    "csharp": "p/csharp",
+    "ruby": "p/ruby",
+    "kotlin": "p/kotlin",
+    "scala": "p/scala",
+    "swift": "p/swift",
+    "rust": "p/rust",
+}
+
 DEFAULT_TIMEOUT = 1800
 
-EXCLUDES = (
-    "node_modules", "dist", "build", "out", "bin", "obj", ".angular", ".next",
-    "vendor", ".venv", "venv", "__pycache__", "coverage", "target", ".git",
+# File types this engine is credited with reading, for the coverage manifest.
+# Narrower than what Semgrep advertises: this list backs a coverage claim.
+READS_EXTENSIONS = (
+    ".php", ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".java", ".kt",
+    ".go", ".rb", ".cs", ".rs", ".swift", ".scala", ".vue", ".html", ".htm",
+    ".sh", ".bash",
 )
+
+
+def resolve_configs(languages: Sequence[str]) -> List[str]:
+    """Security packs plus a language pack for each language actually present."""
+    configs = list(SECURITY_CONFIGS)
+    for language in languages or ():
+        pack = LANGUAGE_CONFIGS.get(str(language).lower())
+        if pack and pack not in configs:
+            configs.append(pack)
+    return configs
 
 # Semgrep reports two different things in `errors`, and they mean different things
 # for trust. A rule that failed to run leaves coverage unknown. A file the parser
@@ -90,17 +130,41 @@ class SemgrepCollector(Collector):
         config: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
         binary: Optional[str] = None,
+        languages: Optional[Sequence[str]] = None,
+        include_dependencies: bool = False,
     ) -> None:
         self.workspace = workspace
+        self.languages = list(languages or ())
         # SEMGREP_RULES lets a project pin its own ruleset without code changes.
-        self.config = config or os.environ.get("SEMGREP_RULES") or DEFAULT_CONFIG
+        override = config or os.environ.get("SEMGREP_RULES") or ""
+        self.configs = [c.strip() for c in override.split(",") if c.strip()] or \
+            resolve_configs(self.languages)
+        self.config = ",".join(self.configs)
+        self.config_source = "override" if override else "framework default (security packs)"
         self.timeout = timeout
         self.binary = binary or (TOOL if tool_available(TOOL) else "opengrep")
+        # What this scan will and will not read, decided from the languages
+        # present rather than from a fixed list, and reported either way.
+        self.exclusions = scanpaths.resolve(
+            scanpaths.INTENT_SAST, self.languages, include_dependencies=include_dependencies
+        )
 
     def collect(self) -> ScannerResult:
         result = self.new_result()
         result.metadata["engine"] = self.binary
         result.metadata["config"] = self.config
+        result.metadata["config_source"] = self.config_source
+        result.metadata["languages"] = self.languages
+        result.metadata["exclusions"] = self.exclusions.to_dict()
+        # Declared reach, consumed by the file-level coverage manifest. Declaring
+        # it is not a claim that the scan succeeded -- the manifest credits
+        # coverage only when the ScannerResult itself is trustworthy.
+        result.metadata["coverage"] = {
+            "exclusions": self.exclusions.to_dict(),
+            "extensions": list(READS_EXTENSIONS),
+        }
+        if self.exclusions.loses_coverage:
+            result.warn(self.exclusions.coverage_note())
 
         if not tool_available(self.binary):
             return result.fail(
@@ -112,14 +176,15 @@ class SemgrepCollector(Collector):
 
         argv = [
             self.binary, "scan",
-            "--config", self.config,
             "--json",
             "--quiet",
             "--metrics", "off",
             "--timeout", "60",
             "--max-target-bytes", "2000000",
         ]
-        for pattern in EXCLUDES:
+        for config in self.configs:
+            argv += ["--config", config]
+        for pattern in self.exclusions.patterns:
             argv += ["--exclude", pattern]
         argv.append(self.workspace)
 
@@ -141,6 +206,7 @@ class SemgrepCollector(Collector):
         blocking, unparsed = _classify_errors(errors)
         finding_count = len(payload.get("results") or [])
 
+        result.metadata["max_target_bytes"] = 2000000
         result.metadata["error_count"] = len(errors)
         result.metadata["blocking_error_count"] = len(blocking)
         result.metadata["unparsed_files"] = sorted(unparsed)
@@ -172,13 +238,14 @@ class SemgrepCollector(Collector):
 
         payload["_engine"] = self.binary
         payload["_config"] = self.config
+        payload["_exclusions"] = self.exclusions.to_dict()
         payload["_unparsed_files"] = sorted(unparsed)
         result.payload = payload
         result.metadata["finding_count"] = finding_count
         return result.succeed().finish()
 
 
-_KW = {"workspace", "config", "timeout", "binary"}
+_KW = {"workspace", "config", "timeout", "binary", "languages", "include_dependencies"}
 
 
 def _build_collector(**kwargs: Any) -> SemgrepCollector:

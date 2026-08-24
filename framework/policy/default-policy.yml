@@ -9,7 +9,7 @@ name: default
 
 # Which phase of the roadmap is live. Categories with a higher phase resolve to
 # NOT_IMPLEMENTED and are printed in every report -- they never disappear.
-active_phase: 6
+active_phase: 7
 
 # Controls that MUST execute successfully for a PASS verdict. If any of these is
 # missing, failed, partial or untested, SECURITY resolves to NOT_VERIFIED.
@@ -39,6 +39,10 @@ security_finding_categories:
   - tls
   - exposed_surface
   - information_disclosure
+  # Personal data or credential material that is already published to everyone
+  # with repository access. Distinct from information_disclosure: no change at
+  # the web server undoes it, so it must not be filed as a server issue.
+  - sensitive_data_exposure
 
 # Maximum number of OPEN security-relevant findings permitted per canonical
 # severity. -1 means unlimited. UNKNOWN fails closed at 0: an unclassifiable

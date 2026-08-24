@@ -228,7 +228,17 @@ def _page_furniture(canvas, doc) -> None:
     canvas.restoreState()
 
 
-def build_pdf(report: Dict[str, Any], output_path: str) -> str:  # noqa: C901 - linear document assembly
+def build_pdf(
+    report: Dict[str, Any],
+    output_path: str,
+    max_table_rows: Optional[int] = None,
+    max_detailed: Optional[int] = None,
+) -> str:  # noqa: C901 - linear document assembly
+    # Limits are arguments, not constants: the defaults show a fraction of the
+    # findings on a legacy codebase, and a reader with no way to raise them
+    # cannot tell a short report from a short list of problems.
+    table_limit = MAX_TABLE_ROWS if max_table_rows is None else max(0, int(max_table_rows))
+    detail_limit = MAX_DETAILED_FINDINGS if max_detailed is None else max(0, int(max_detailed))
     if not REPORTLAB_AVAILABLE:
         raise PdfGenerationError(
             "reportlab is not installed, so the PDF report could not be generated (%s). "
@@ -543,7 +553,7 @@ def build_pdf(report: Dict[str, Any], output_path: str) -> str:  # noqa: C901 - 
         )
     else:
         rows = []
-        for index, finding in enumerate(items[:MAX_TABLE_ROWS], 1):
+        for index, finding in enumerate(items[:table_limit], 1):
             rows.append(
                 [
                     index,
@@ -567,18 +577,20 @@ def build_pdf(report: Dict[str, Any], output_path: str) -> str:  # noqa: C901 - 
                 styles,
             )
         )
-        if len(items) > MAX_TABLE_ROWS:
+        if len(items) > table_limit:
             story.append(Spacer(1, 2 * mm))
             story.append(
                 Paragraph(
-                    "Table truncated to %d of %d findings. The complete set is in final-report.json."
-                    % (MAX_TABLE_ROWS, len(items)),
+                    "Table truncated to %d of %d findings. The complete, untruncated list is in "
+                    "findings.csv (one row per finding, with an owner column to fill in) and in "
+                    "final-report.json."
+                    % (table_limit, len(items)),
                     styles.note,
                 )
             )
 
         story.append(Paragraph("6.1 Finding detail", styles.h1))
-        for index, finding in enumerate(items[:MAX_DETAILED_FINDINGS], 1):
+        for index, finding in enumerate(items[:detail_limit], 1):
             block = [
                 Paragraph(
                     "%d. <b>[%s]</b> %s" % (index, _text(finding["severity"]), _text(finding["description"], 130)),
@@ -608,11 +620,12 @@ def build_pdf(report: Dict[str, Any], output_path: str) -> str:  # noqa: C901 - 
                 Spacer(1, 3 * mm),
             ]
             story.append(KeepTogether(block))
-        if len(items) > MAX_DETAILED_FINDINGS:
+        if len(items) > detail_limit:
             story.append(
                 Paragraph(
-                    "Detailed entries truncated to the %d most severe of %d findings."
-                    % (MAX_DETAILED_FINDINGS, len(items)),
+                    "Detailed entries truncated to the %d most severe of %d findings. Every "
+                    "finding, with the same fields, is in findings.csv."
+                    % (detail_limit, len(items)),
                     styles.note,
                 )
             )
@@ -654,6 +667,48 @@ def build_pdf(report: Dict[str, Any], output_path: str) -> str:  # noqa: C901 - 
         story.append(Paragraph("7.2 Scanner warnings", styles.h2))
         for tool, warning in warnings:
             story.append(Paragraph("&bull; <b>%s</b>: %s" % (_text(tool), _text(warning)), styles.body))
+
+    # --- File coverage -------------------------------------------------------
+    # Section 7 says which CONTROLS ran. This says which FILES they read. A
+    # scanner that completed over half a repository reports identically to one
+    # that read all of it, so without this the reader cannot tell the difference
+    # between "nothing was found" and "most of it was never opened".
+    story.append(Paragraph("7.3 File coverage", styles.h2))
+    coverage = report.get("file_coverage") or {}
+    if not coverage.get("available"):
+        story.append(Paragraph(
+            "<b>File-level coverage is NOT ESTABLISHED for this run.</b> %s This is not a "
+            "statement that every file was analysed."
+            % _text(coverage.get("reason", "the census did not run")),
+            styles.warn,
+        ))
+    else:
+        story.append(
+            _data_table(
+                ["Measure", "Value"],
+                [
+                    ["Code files in workspace", coverage.get("code_files", 0)],
+                    ["Read by a completed scanner", coverage.get("code_files_analysed", 0)],
+                    ["NOT read by any scanner", coverage.get("code_files_not_analysed", 0)],
+                    ["Coverage", "%.1f%%" % coverage.get("coverage_percent", 0.0)],
+                ],
+                [90 * mm, 80 * mm],
+                styles,
+            )
+        )
+        statement = _text(coverage.get("statement", ""))
+        story.append(Paragraph(statement, styles.warn if not coverage.get("complete") else styles.body))
+        not_analysed = coverage.get("not_analysed") or {}
+        if not_analysed:
+            rows = [[bucket, detail.get("count", 0)] for bucket, detail in not_analysed.items()]
+            story.append(Paragraph("Why files were not analysed", styles.h2))
+            story.append(_data_table(["Reason", "Files"], rows, [120 * mm, 50 * mm], styles))
+            story.append(Paragraph(
+                "The individual files are listed in report.md and in final-report.json.",
+                styles.small,
+            ))
+        for note in (coverage.get("notes") or [])[:6]:
+            story.append(Paragraph("&bull; %s" % _text(note), styles.small))
 
     # --- Category matrix -----------------------------------------------------
     story.append(Paragraph("8. Security category matrix", styles.h1))
@@ -775,6 +830,15 @@ def build_pdf(report: Dict[str, Any], output_path: str) -> str:  # noqa: C901 - 
     return output_path
 
 
-def write_pdf(report: Dict[str, Any], output_dir: str, filename: str = "security-report.pdf") -> str:
+def write_pdf(
+    report: Dict[str, Any],
+    output_dir: str,
+    filename: str = "security-report.pdf",
+    max_table_rows: Optional[int] = None,
+    max_detailed: Optional[int] = None,
+) -> str:
     os.makedirs(output_dir, exist_ok=True)
-    return build_pdf(report, os.path.join(output_dir, filename))
+    return build_pdf(
+        report, os.path.join(output_dir, filename),
+        max_table_rows=max_table_rows, max_detailed=max_detailed,
+    )

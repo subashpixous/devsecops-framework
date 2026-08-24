@@ -4,7 +4,7 @@ A reusable security validation layer for production repositories. It wraps an
 existing delivery pipeline instead of replacing it: it does not build, does not
 deploy, and does not modify the project it inspects.
 
-**Current release: v0.2.0 — the complete approved pipeline, all six phases.**
+**Current release: v0.4.0 — file-level coverage, repository and web-server categories, and findings delivered to the pull request.**
 
 ---
 
@@ -13,6 +13,7 @@ deploy, and does not modify the project it inspects.
 | Guarantee | How |
 |---|---|
 | No false PASS | Every failure path resolves to `NOT_VERIFIED`. A missing tool, a failed scan, a partial result, a skipped input and a malformed payload are all non-PASS. Enforced by unit tests that must pass before a release tag is cut. |
+| No unread code | Every file lands in one coverage bucket with a reason: analysed, excluded (pattern named), no engine for its type, or its engine did not complete. A scanner that failed is credited with nothing. |
 | No silent gaps | All 17 security categories resolve to exactly one of `PASS` / `FAILED` / `NOT_VERIFIED` / `NOT_APPLICABLE` / `NOT_IMPLEMENTED` and appear in every report. |
 | Status independence | `BUILD`, `DEPLOYMENT`, `SECURITY` and `RUNTIME_SECURITY` are computed separately. A successful deployment can never raise a security status. |
 | No secrets in output | Gitleaks' `Secret`/`Match` fields are stripped at collection; bundle findings carry a length and a SHA-256 prefix, never the value; tool output is redacted; ZAP and Nuclei response echoes are dropped. |
@@ -66,6 +67,8 @@ where its inputs actually exist.
 | Dependency / SCA | Trivy | PRE_BUILD | binary |
 | Infrastructure as code | Checkov | PRE_BUILD | binary, IaC present |
 | API specification | 42Crunch | PRE_BUILD | `FORTYTWO_CRUNCH_TOKEN`, spec file |
+| Repository hygiene & data exposure | framework-native | PRE_BUILD | git |
+| Web server configuration | framework-native | PRE_BUILD | committed `.htaccess`/nginx conf |
 | Container image | Trivy | POST_BUILD | binary, `images` input |
 | SBOM | Trivy (CycloneDX) | POST_BUILD | binary |
 | Frontend bundle secrets | framework-native | POST_BUILD | built output |
@@ -86,6 +89,10 @@ could not run is `NOT_VERIFIED` and says why.
 Add one file to the project — see [examples/caller-workflow.yml](examples/caller-workflow.yml):
 
 ```yaml
+permissions:
+  contents: read
+  security-events: write   # so findings land in the PR, not only in an artifact
+
 jobs:
   security:
     uses: <owner>/devsecops-framework/.github/workflows/security-pipeline.yml@<sha>
@@ -109,7 +116,8 @@ python -m framework.cli run --workspace /path --output security-results
 
 Useful flags: `--stage PRE_BUILD,POST_BUILD` · `--images org/app:sha` ·
 `--deployed-url https://app.example.com` · `--baseline prev/normalized-findings.json` ·
-`--exceptions .security/exceptions.yml` · `--fail-on-security`
+`--exceptions .security/exceptions.yml` · `--fail-on-security` ·
+`--include-dependencies` · `--max-detailed-findings 500`
 
 Exit codes: `0` reports generated · `2` SECURITY=FAILED · `3` SECURITY=NOT_VERIFIED
 (both only with `--fail-on-security`) · `4` the framework itself failed. Exit `4`
@@ -124,6 +132,8 @@ security-results/
 ├── sbom.cdx.json              CycloneDX SBOM, when generated
 ├── normalized-findings.json   common schema — also the next run's baseline
 ├── final-report.json          machine-readable source of truth
+├── findings.csv               EVERY finding, never truncated, with an owner column
+├── security.sarif             uploaded to code scanning — inline in the PR
 ├── report.md
 └── security-report.pdf
 ```
@@ -159,6 +169,7 @@ zero-day threats.
 | 4 | Finding lifecycle, exceptions, accepted-risk expiry | **shipped** |
 | 5 | OWASP ZAP, Nuclei, runtime probes, 42Crunch | **shipped** |
 | 6 | Prowler, IAM Access Analyzer | **shipped** |
+| 7 | Repository hygiene, web server config, file-level coverage, SARIF | **shipped** |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
 [docs/ONBOARDING.md](docs/ONBOARDING.md) and

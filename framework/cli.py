@@ -34,6 +34,7 @@ from .core.categories import PIPELINE_STAGES, SECURITY_FAILED, SECURITY_NOT_VERI
 from .core.context import RunContext
 from .core.lifecycle import apply_lifecycle, load_baseline, load_exceptions
 from .core.policy import Policy
+from .core.coverage import build_manifest
 from .core.registry import (
     CATEGORY_BY_KEY,
     import_failures,
@@ -45,9 +46,11 @@ from .core.schema import Finding
 from .core.status_engine import StatusEngine
 from .core.toolrunner import tool_available, tool_version
 from .detect.detector import detect
+from .report.csv_writer import write_csv
 from .report.json_writer import build_report, write_json, write_normalized_findings
 from .report.markdown_writer import write_markdown
 from .report.pdf_writer import PdfGenerationError, write_pdf
+from .report.sarif_writer import write_sarif
 
 EXIT_OK = 0
 EXIT_SECURITY_FAILED = 2
@@ -110,6 +113,20 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--baseline", default="", help="Previous normalized-findings.json for lifecycle diffing.")
     run_parser.add_argument("--exceptions", default="", help="Exceptions/accepted-risk file (YAML or JSON).")
     run_parser.add_argument("--fail-on-security", action="store_true")
+    run_parser.add_argument(
+        "--max-table-rows", type=int, default=0,
+        help="Findings table rows in report.md / the PDF (0 = writer default). "
+             "findings.csv is never truncated.",
+    )
+    run_parser.add_argument(
+        "--max-detailed-findings", type=int, default=0,
+        help="Detailed finding entries in report.md / the PDF (0 = writer default).",
+    )
+    run_parser.add_argument(
+        "--include-dependencies", action="store_true",
+        help="Also run static analysis over vendored dependency source (vendor/, node_modules/). "
+             "Off by default; either way the choice is recorded in the coverage manifest.",
+    )
     run_parser.add_argument("--sonar-payload", default="", help="Self-test only: load a captured payload.")
     return parser
 
@@ -180,6 +197,11 @@ def _collect(
         "bundle_dirs": _csv(args.bundle_dirs),
         "openapi_files": _csv(args.openapi_files) or list(capabilities.get("openapi_spec_files") or []),
         "output_dir": args.output,
+        # Detected languages drive per-tool path policy: which vendored directory
+        # is dependency code, and which rule packs a SAST engine should load.
+        "languages": list(capabilities.get("languages") or []),
+        "web_server_config_files": list(capabilities.get("web_server_config_files") or []),
+        "include_dependencies": bool(getattr(args, "include_dependencies", False)),
     }
 
     results: List[ScannerResult] = []
@@ -366,13 +388,41 @@ def command_run(args: argparse.Namespace) -> int:  # noqa: C901 - linear orchest
         import_failures=import_failures(),
     )
 
-    report = build_report(context, capabilities, policy, assessment, findings, results)
+    # File-level coverage census. Built AFTER collection so it reflects which
+    # scanners actually completed -- a scanner that failed is credited with
+    # nothing, and the files it would have read surface as unanalysed rather
+    # than being quietly attributed to it.
+    file_coverage = build_manifest(
+        args.workspace, results, list(capabilities.get("languages") or [])
+    )
+    if file_coverage.get("available"):
+        _log("file coverage: %d/%d code files analysed (%.1f%%)"
+             % (file_coverage["code_files_analysed"], file_coverage["code_files"],
+                file_coverage["coverage_percent"]))
+        if not file_coverage.get("complete"):
+            _log("  %s" % file_coverage["statement"])
+    else:
+        _log("file coverage: NOT ESTABLISHED (%s)" % file_coverage.get("reason", ""))
+
+    report = build_report(
+        context, capabilities, policy, assessment, findings, results,
+        file_coverage=file_coverage,
+    )
+
+    table_rows = args.max_table_rows or None
+    detailed = args.max_detailed_findings or None
 
     _log("wrote %s" % write_json(report, args.output))
     _log("wrote %s" % write_normalized_findings(findings, args.output))
-    _log("wrote %s" % write_markdown(report, args.output))
+    # findings.csv is the untruncated list. The narrative reports are bounded so
+    # they stay readable; this one exists so nothing is only ever summarised.
+    _log("wrote %s" % write_csv(report, args.output))
+    # SARIF puts each finding on its line in the pull request and in the
+    # repository's Security tab. A finding nobody sees is a finding nobody fixes.
+    _log("wrote %s" % write_sarif(report, args.output))
+    _log("wrote %s" % write_markdown(report, args.output, max_table_rows=table_rows, max_detailed=detailed))
     try:
-        _log("wrote %s" % write_pdf(report, args.output))
+        _log("wrote %s" % write_pdf(report, args.output, max_table_rows=table_rows, max_detailed=detailed))
     except PdfGenerationError as exc:
         _log("ERROR: %s" % exc)
         return EXIT_FRAMEWORK_ERROR

@@ -76,6 +76,7 @@ def load_builtin_scanners() -> None:
     modules = (
         # PRE-BUILD
         "sonarqube", "semgrep", "gitleaks", "checkov", "apispec",
+        "repo_hygiene", "web_config",
         # PRE-BUILD + POST-BUILD (trivy registers four scanners)
         "trivy",
         # POST-BUILD

@@ -8,7 +8,7 @@ combine them into a single "overall" verdict.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 MAX_DETAILED_FINDINGS = 60
 MAX_TABLE_ROWS = 400
@@ -41,11 +41,21 @@ def _truncate(text: Any, limit: int = 160) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "\u2026"
 
 
-def render_markdown(report: Dict[str, Any]) -> str:  # noqa: C901 - linear document assembly
+def render_markdown(
+    report: Dict[str, Any],
+    max_table_rows: Optional[int] = None,
+    max_detailed: Optional[int] = None,
+) -> str:  # noqa: C901 - linear document assembly
     project = report["project"]
     status = report["status"]
     verdict = report["verdict"]
     findings = report["findings"]
+    # Limits are arguments, not constants: on a legacy codebase the defaults show
+    # a fraction of the findings, and a reader with no way to raise them cannot
+    # tell a short report from a short list of problems.
+    table_limit = MAX_TABLE_ROWS if max_table_rows is None else max(0, int(max_table_rows))
+    detail_limit = MAX_DETAILED_FINDINGS if max_detailed is None else max(0, int(max_detailed))
+
     lines: List[str] = []
     add = lines.append
 
@@ -246,7 +256,7 @@ def render_markdown(report: Dict[str, Any]) -> str:  # noqa: C901 - linear docum
             "controls that were not executed.")
         add("")
     else:
-        shown = items[:MAX_TABLE_ROWS]
+        shown = items[:table_limit]
         add("| # | Severity | State | Category | Tool | File | Line | Description |")
         add("|---|---|---|---|---|---|---|---|")
         for index, finding in enumerate(shown, 1):
@@ -256,14 +266,17 @@ def render_markdown(report: Dict[str, Any]) -> str:  # noqa: C901 - linear docum
                 finding["line"] or "-", _truncate(finding["description"], 80),
             ))
         add("")
-        if len(items) > MAX_TABLE_ROWS:
-            add("> Table truncated to %d of %d findings. The complete set is in `final-report.json` "
-                "and `normalized-findings.json`." % (MAX_TABLE_ROWS, len(items)))
+        if len(items) > table_limit:
+            add("> Table truncated to %d of %d findings. **The complete, untruncated list is in "
+                "`findings.csv`** (one row per finding, sortable, with an empty owner column), "
+                "and in `final-report.json` / `normalized-findings.json`. Raise "
+                "`--max-table-rows` to show more here."
+                % (table_limit, len(items)))
             add("")
 
         add("### Finding detail")
         add("")
-        for index, finding in enumerate(items[:MAX_DETAILED_FINDINGS], 1):
+        for index, finding in enumerate(items[:detail_limit], 1):
             add("#### %d. [%s] %s" % (index, finding["severity"], _truncate(finding["description"], 110)))
             add("")
             add("| Field | Value |")
@@ -287,9 +300,11 @@ def render_markdown(report: Dict[str, Any]) -> str:  # noqa: C901 - linear docum
             add("| Commit | `%s` |" % _escape(finding["commit"]))
             add("| Branch | %s |" % _escape(finding["branch"]))
             add("")
-        if len(items) > MAX_DETAILED_FINDINGS:
-            add("> Detailed entries truncated to the %d most severe of %d findings."
-                % (MAX_DETAILED_FINDINGS, len(items)))
+        if len(items) > detail_limit:
+            add("> Detailed entries truncated to the %d most severe of %d findings. Every "
+                "finding, with the same fields, is in `findings.csv`. Raise "
+                "`--max-detailed-findings` to show more here."
+                % (detail_limit, len(items)))
             add("")
 
     # --- Scanners -------------------------------------------------------------
@@ -321,6 +336,54 @@ def render_markdown(report: Dict[str, Any]) -> str:  # noqa: C901 - linear docum
             for warning in scanner["warnings"]:
                 add("- **%s**: %s" % (_escape(scanner["tool"]), _escape(warning)))
         add("")
+
+    # --- File coverage --------------------------------------------------------
+    # Section 8 says which CONTROLS ran. This says which FILES they read, which
+    # is the question a category status cannot answer: a scanner that completed
+    # over half the repository reports identically to one that read all of it.
+    add("### 8.1 File Coverage")
+    add("")
+    coverage = report.get("file_coverage") or {}
+    if not coverage.get("available"):
+        add("> **File-level coverage is NOT ESTABLISHED for this run.** %s"
+            % _escape(coverage.get("reason", "the census did not run")))
+        add(">")
+        add("> This is not a statement that every file was analysed.")
+        add("")
+    else:
+        add("| Measure | Value |")
+        add("|---|---|")
+        add("| Code files in workspace | %d |" % coverage.get("code_files", 0))
+        add("| Read by a completed scanner | %d |" % coverage.get("code_files_analysed", 0))
+        add("| **NOT read by any scanner** | **%d** |" % coverage.get("code_files_not_analysed", 0))
+        add("| Coverage | %.1f%% |" % coverage.get("coverage_percent", 0.0))
+        add("")
+        add("**%s**" % _escape(coverage.get("statement", "")))
+        add("")
+
+        not_analysed = coverage.get("not_analysed") or {}
+        if not_analysed:
+            add("| Reason not analysed | Files |")
+            add("|---|---|")
+            for bucket, detail in not_analysed.items():
+                add("| `%s` | %d |" % (_escape(bucket), detail.get("count", 0)))
+            add("")
+            for bucket, detail in not_analysed.items():
+                shown = detail.get("files") or []
+                if not shown:
+                    continue
+                add("<details><summary>%s -- %d file(s), showing %d</summary>"
+                    % (_escape(bucket), detail.get("count", 0), len(shown)))
+                add("")
+                for entry in shown:
+                    add("- `%s` -- %s" % (_escape(entry.get("file")), _escape(entry.get("reason"))))
+                add("")
+                add("</details>")
+                add("")
+
+        for note in coverage.get("notes") or []:
+            add("> %s" % _escape(note))
+            add("")
 
     # --- Category matrix ------------------------------------------------------
     add("---")
@@ -410,9 +473,15 @@ def render_markdown(report: Dict[str, Any]) -> str:  # noqa: C901 - linear docum
     return "\n".join(lines)
 
 
-def write_markdown(report: Dict[str, Any], output_dir: str, filename: str = "report.md") -> str:
+def write_markdown(
+    report: Dict[str, Any],
+    output_dir: str,
+    filename: str = "report.md",
+    max_table_rows: Optional[int] = None,
+    max_detailed: Optional[int] = None,
+) -> str:
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, filename)
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(render_markdown(report))
+        handle.write(render_markdown(report, max_table_rows, max_detailed))
     return path

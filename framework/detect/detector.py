@@ -90,6 +90,7 @@ class Detection:
         self.sonar_properties: List[str] = []
         self.frontend = False
         self.backend = False
+        self.web_server_config_files: List[str] = []
 
     def note(self, key: str, item: str) -> None:
         self.evidence.setdefault(key, [])
@@ -246,6 +247,43 @@ def _classify_manifest(detection: Detection, root: str, filename: str, relative:
         detection.note("sonarqube", relative)
 
 
+# Web server configuration recognised by name. `.htaccess` carries no extension
+# and `web.config` looks like any other XML, so extension-based classification
+# misses both -- which is how the file that decides whether an upload directory
+# executes PHP ends up read by nothing.
+_WEB_CONFIG_NAMES = {
+    ".htaccess", ".htpasswd", "nginx.conf", "httpd.conf", "apache2.conf",
+    "web.config", "lighttpd.conf", "default.conf", "site.conf",
+}
+
+# A generic `.conf` is only server configuration if it contains server directives.
+_WEB_CONFIG_MARKERS = re.compile(
+    r"^\s*(server\s*\{|<VirtualHost|<Directory|location\s+[^\s{]+\s*\{|listen\s+\d)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _classify_web_server_config(
+    detection: Detection, path: str, filename: str, relative: str
+) -> None:
+    """Record committed Apache/nginx/IIS configuration.
+
+    Named files are taken at face value. A generic `.conf` has to prove itself
+    with a server directive, so an application's own config files are not
+    mistaken for the web server's.
+    """
+    if len(detection.web_server_config_files) >= 200:
+        return
+    lower = filename.lower()
+    if lower in _WEB_CONFIG_NAMES:
+        detection.web_server_config_files.append(relative)
+        detection.note("web_server_config", relative)
+        return
+    if lower.endswith((".conf", ".vhost")) and _WEB_CONFIG_MARKERS.search(_read(path, 20_000) or ""):
+        detection.web_server_config_files.append(relative)
+        detection.note("web_server_config", relative)
+
+
 def _classify_content(detection: Detection, path: str, relative: str) -> None:
     """Content probes for formats that cannot be identified by filename alone."""
     lower = relative.lower()
@@ -385,6 +423,7 @@ def detect(workspace: str = ".", overrides: Optional[Dict[str, Any]] = None) -> 
                 detection.languages.add(LANGUAGE_BY_EXTENSION[extension])
 
             _classify_manifest(detection, root, filename, relative, workspace)
+            _classify_web_server_config(detection, os.path.join(root, filename), filename, relative)
             _classify_content(detection, os.path.join(root, filename), relative)
 
     # Frontend/backend inference from unambiguous structural signals only.
@@ -392,6 +431,14 @@ def detect(workspace: str = ".", overrides: Optional[Dict[str, Any]] = None) -> 
         detection.frontend = detection.frontend or bool(detection.frameworks & {"angular", "react", "vue", "nextjs", "nuxt", "svelte"})
     if detection.frameworks & {"aspnet-core", "spring-boot", "django", "flask", "fastapi", "express", "nestjs", "fastify", "koa", "laravel", "symfony", "rails"}:
         detection.backend = True
+    if "php" in detection.languages:
+        # PHP source has exactly one execution mode: interpreted by a web server
+        # on request. A .php file in the tree therefore IS a server-side
+        # application, framework or not -- and a framework-only rule left plain
+        # PHP projects classified as "not deployable", which silently excused
+        # them from every runtime security category.
+        detection.backend = True
+        detection.note("backend", "php sources are executed server-side")
 
     cloud_info = _detect_cloud_and_target(workspace, detection)
 
@@ -418,6 +465,7 @@ def detect(workspace: str = ".", overrides: Optional[Dict[str, Any]] = None) -> 
         "helm": detection.helm,
         "openapi_spec_files": detection.openapi_spec_files,
         "sonar_properties_files": detection.sonar_properties,
+        "web_server_config_files": detection.web_server_config_files,
         "ci_workflows": sorted(detection.ci_workflows),
         "source_file_counts": dict(sorted(detection.extension_counts.items(), key=lambda kv: -kv[1])),
         "evidence": detection.evidence,

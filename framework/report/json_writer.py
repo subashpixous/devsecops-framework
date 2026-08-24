@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..core.categories import (
     CATEGORY_FAILED,
@@ -40,6 +40,7 @@ def build_report(
     assessment: SecurityAssessment,
     findings: List[Finding],
     scanner_results: List[Any],
+    file_coverage: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble the complete report document."""
     ordered = sort_findings(findings)
@@ -91,6 +92,17 @@ def build_report(
             "items": [f.to_dict() for f in ordered],
         },
         "scanners": [r.to_dict() for r in scanner_results],
+        # File-level coverage: which files a scanner actually read. The category
+        # model answers "which control ran"; this answers "was any of my code
+        # never looked at", which no category status can express.
+        "file_coverage": file_coverage or {
+            "available": False,
+            "reason": "the file-coverage census was not run for this report",
+            "warning": (
+                "File-level coverage is UNKNOWN for this run. This is not a statement that "
+                "every file was analysed."
+            ),
+        },
         "categories": [c.to_dict() for c in assessment.categories],
         "category_summary": {
             "passed": keys_with_status(CATEGORY_PASS),

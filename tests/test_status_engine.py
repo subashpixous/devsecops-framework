@@ -292,7 +292,18 @@ class DefaultPolicyTestCase(unittest.TestCase):
         self.policy = Policy.load()
 
     def test_all_phases_are_active_by_default(self):
-        self.assertEqual(self.policy.active_phase, 6)
+        # Asserted against the category registry rather than a literal. The
+        # invariant is "the shipped policy leaves no declared category sitting at
+        # NOT_IMPLEMENTED", which a hard-coded 6 stops expressing the moment a
+        # phase 7 category is added -- it then fails for the one reason that is
+        # not a defect.
+        highest = max(category.phase for category in CATEGORY_REGISTRY)
+        self.assertEqual(
+            self.policy.active_phase, highest,
+            "default policy active_phase (%d) must cover the highest declared category "
+            "phase (%d), otherwise shipped categories report NOT_IMPLEMENTED"
+            % (self.policy.active_phase, highest),
+        )
 
     def test_required_categories_cover_the_always_applicable_sast_and_secrets(self):
         for key in ("sast_sonarqube", "sast_semgrep", "secret_scanning"):

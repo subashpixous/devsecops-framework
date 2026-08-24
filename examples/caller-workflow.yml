@@ -19,6 +19,12 @@ on:
 
 permissions:
   contents: read
+  # Lets the framework upload security.sarif so each finding appears on its line
+  # in the pull request and in the Security tab. Without it the SARIF is still
+  # written to the artifact, the upload step is skipped, and developers have to
+  # download a report to see anything -- which in practice means nobody does.
+  # If code scanning is unavailable on your plan, set upload_sarif: false below.
+  security-events: write
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -45,6 +51,11 @@ jobs:
 
       # Observe, do not block.
       fail_on_security: false
+
+      # Set false only where code scanning is unavailable (some private-repo
+      # plans, forked-PR events). The SARIF file is written to the artifact
+      # either way.
+      upload_sarif: true
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}

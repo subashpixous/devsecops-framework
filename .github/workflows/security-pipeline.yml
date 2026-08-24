@@ -95,6 +95,14 @@ on:
         description: "Install the external scanners. Disable to use a pre-baked runner image."
         type: boolean
         default: true
+      upload_sarif:
+        description: >-
+          Upload findings to GitHub code scanning so they appear inline on the pull
+          request and in the Security tab. Requires the caller to grant
+          `security-events: write`. Disable for a repository where code scanning is
+          unavailable; the SARIF file is written to the artifact either way.
+        type: boolean
+        default: true
       fail_on_security:
         description: "Fail the job when SECURITY is not PASS. Default false: observe, do not block."
         type: boolean
@@ -161,9 +169,13 @@ jobs:
   security:
     name: Security validation
     runs-on: ${{ inputs.runs_on }}
-    # Least privilege: read the code, write nothing.
+    # Least privilege. `security-events: write` is the one write scope, and it
+    # exists solely so findings reach the pull request instead of an artifact
+    # nobody downloads. A caller that does not grant it sets upload_sarif: false
+    # and the upload step is skipped rather than failing the run.
     permissions:
       contents: read
+      security-events: write
     outputs:
       security_status: ${{ steps.run.outputs.security_status }}
       runtime_security_status: ${{ steps.run.outputs.runtime_security_status }}
@@ -335,6 +347,23 @@ jobs:
           mkdir -p "${GITHUB_WORKSPACE}/security-results"
           [ -f /tmp/tool-install.log ] && \
             cp /tmp/tool-install.log "${GITHUB_WORKSPACE}/security-results/tool-install.log" || true
+
+      - name: Upload findings to GitHub code scanning
+        # A finding in a downloadable artifact is a finding nobody reads. This is
+        # what puts each one on its line in the pull request.
+        #
+        # always(): a run that ended in FAILED is exactly the run whose findings
+        # the developer needs to see.
+        #
+        # continue-on-error: code scanning is unavailable on some plans and on
+        # forked-PR events. That is a delivery problem, not a security result, and
+        # it must never convert into one.
+        if: always() && inputs.upload_sarif
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2d92b76c45b91eb80fc44c74ce3fce0ee94e8f9d  # v3.30.0
+        with:
+          sarif_file: security-results/security.sarif
+          category: devsecops-framework
 
       - name: Upload security results
         # always(): a failed or blocked run is exactly when the evidence matters most.

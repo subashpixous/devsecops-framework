@@ -18,6 +18,7 @@ import os
 import tempfile
 from typing import Any, Dict, List, Optional
 
+from ..core import scanpaths
 from ..core.registry import ScannerRegistration, register_scanner
 from ..core.toolrunner import accepted, run, tool_available, tool_version
 from .base import Collector, ScannerResult
@@ -85,6 +86,12 @@ class GitleaksCollector(Collector):
         is_git_repo = os.path.isdir(os.path.join(self.workspace, ".git"))
         mode = "git" if (self.scan_history and is_git_repo) else "dir"
         result.metadata["mode"] = mode
+        # Secret scanning excludes nothing but version-control internals: a
+        # credential committed inside a vendored directory or a built artefact is
+        # exposed exactly as much as one committed at the root.
+        plan = scanpaths.resolve(scanpaths.INTENT_SECRET)
+        result.metadata["exclusions"] = plan.to_dict()
+        result.metadata["coverage"] = {"exclusions": plan.to_dict(), "extensions": []}
         if self.scan_history and not is_git_repo:
             result.partial(
                 "Workspace is not a git repository; git history was NOT scanned. "
