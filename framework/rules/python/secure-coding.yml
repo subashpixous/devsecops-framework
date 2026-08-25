@@ -23,16 +23,25 @@ rules:
         so `logger.exception(e)` -- the correct handling -- is not flagged.
       remediation: >-
         Return a fixed message plus a correlation id; log str(e) with that id.
+    # PATTERN FORM: these match the response-CONSTRUCTING CALL, not the `return`
+    # statement. Anchoring on `return` missed the most common Flask shape of all
+    # --  `return jsonify({...}), 500` -- because the tuple return is a different
+    # AST node. Matching the call covers the tuple return, the plain return, and
+    # assign-then-return in one, and loses nothing: jsonify/HttpResponse/Response
+    # ARE the response, so a str(exception) inside one is a disclosure wherever
+    # it sits. The sink requirement is what keeps `logger.exception(e)` silent.
     patterns:
       - pattern-either:
-          - pattern: return jsonify(..., str($EX), ...)
-          - pattern: 'return jsonify({..., $K: str($EX), ...})'
-          - pattern: 'return JsonResponse({..., $K: str($EX), ...})'
-          - pattern: return HttpResponse(str($EX), ...)
-          - pattern: return Response(str($EX), ...)
-          - pattern: 'return {..., $K: str($EX), ...}, $CODE'
+          - pattern: jsonify(..., str($EX), ...)
+          - pattern: 'jsonify({..., $K: str($EX), ...})'
+          - pattern: 'JsonResponse({..., $K: str($EX), ...})'
+          - pattern: HttpResponse(str($EX), ...)
+          - pattern: Response(str($EX), ...)
+          - pattern: jsonify(..., f"...{$EX}...", ...)
+          - pattern: 'jsonify({..., $K: f"...{$EX}...", ...})'
           - pattern: raise HTTPException(..., detail=str($EX), ...)
-          - pattern: return jsonify(..., f"...{$EX}...", ...)
+          - pattern: 'return {..., $K: str($EX), ...}, $CODE'
+          - pattern: 'return {..., $K: str($EX), ...}'
       - metavariable-regex:
           metavariable: $EX
           regex: (?i)^(e|ex|exc|exception|err|error)$
@@ -54,11 +63,16 @@ rules:
         there is no legitimate reason to send it to a client.
       remediation: >-
         Log the traceback server-side. Return only a correlation id.
+    # Same reasoning as the rule above: match the response constructor so the
+    # tuple-return form is covered. The response sink is retained deliberately --
+    # `logger.error(traceback.format_exc())` is correct handling and must stay
+    # silent, which a bare `traceback.format_exc()` pattern would break.
     pattern-either:
-      - pattern: return jsonify(..., traceback.format_exc(), ...)
-      - pattern: 'return jsonify({..., $K: traceback.format_exc(), ...})'
-      - pattern: return HttpResponse(traceback.format_exc(), ...)
-      - pattern: return Response(traceback.format_exc(), ...)
+      - pattern: jsonify(..., traceback.format_exc(), ...)
+      - pattern: 'jsonify({..., $K: traceback.format_exc(), ...})'
+      - pattern: 'JsonResponse({..., $K: traceback.format_exc(), ...})'
+      - pattern: HttpResponse(traceback.format_exc(), ...)
+      - pattern: Response(traceback.format_exc(), ...)
       - pattern: return traceback.format_exc()
 
   - id: devsecops-framework.secure-coding.python.debug-enabled
