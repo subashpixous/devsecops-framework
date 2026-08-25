@@ -1,0 +1,206 @@
+# Secure-coding patterns -- Java / Kotlin (Spring-aware)
+#
+# `languages: [java]` in the engine covers .java. Kotlin files are matched by
+# the Kotlin-specific rules below where the syntax differs. The directory is
+# mapped to both detected languages so a mixed JVM project selects this file.
+
+rules:
+  - id: devsecops-framework.secure-coding.java.exception-message-to-response
+    languages: [java]
+    severity: ERROR
+    message: >-
+      An exception message is returned in an HTTP response. JDBC and Hibernate
+      exception text contains SQL fragments, constraint names and connection
+      details.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: HIGH
+      rationale: >-
+        CWE-209. Requires the exception value inside a response construction, so
+        logger.error("...", e) -- the correct handling -- is not flagged.
+      remediation: >-
+        Return a generic message with a correlation id from a
+        @ControllerAdvice handler; log the exception with that id.
+    patterns:
+      - pattern-either:
+          - pattern: return ResponseEntity.$STATUS(...).body($EX.getMessage());
+          - pattern: return ResponseEntity.$STATUS(...).body($EX.toString());
+          - pattern: return new ResponseEntity<>($EX.getMessage(), ...);
+          - pattern: $RESP.getWriter().println($EX.getMessage());
+          - pattern: $RESP.getWriter().write($EX.getMessage());
+          - pattern: $RESP.sendError($CODE, $EX.getMessage());
+          - pattern: return $EX.getMessage();
+      - metavariable-regex:
+          metavariable: $EX
+          regex: (?i)^(e|ex|exc|exception|err|error)$
+
+  - id: devsecops-framework.secure-coding.java.stack-trace-to-response
+    languages: [java]
+    severity: ERROR
+    message: >-
+      A stack trace is written to the HTTP response. It discloses the full call
+      chain, package structure and library versions.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: HIGH
+      rationale: >-
+        CWE-209. printStackTrace on a response writer is unambiguous -- there is
+        no reason for a client to receive a stack trace.
+      remediation: >-
+        Log the stack trace to the application log; return only a correlation
+        id.
+    pattern-either:
+      - pattern: $EX.printStackTrace($RESP.getWriter());
+      - pattern: $EX.printStackTrace(new PrintWriter($RESP.getOutputStream()));
+
+  - id: devsecops-framework.secure-coding.java.sql-string-concatenation
+    languages: [java]
+    severity: ERROR
+    message: >-
+      A SQL statement is built by concatenation and executed on a Statement. If
+      any concatenated value derives from a request this is SQL injection.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-89"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-89. Statement with concatenation is the canonical JDBC injection
+        shape; PreparedStatement with bound parameters is the correct form and
+        is never more difficult.
+      remediation: >-
+        Use PreparedStatement with `?` placeholders and setString/setInt. In
+        JPA use named parameters, never string building.
+    pattern-either:
+      - pattern: $STMT.executeQuery($A + $B)
+      - pattern: $STMT.executeUpdate($A + $B)
+      - pattern: $STMT.execute($A + $B)
+      - pattern: $CONN.prepareStatement($A + $B)
+      - pattern: $EM.createQuery($A + $B)
+      - pattern: $EM.createNativeQuery($A + $B)
+      - pattern: String.format("...SELECT...", ...)
+
+  - id: devsecops-framework.secure-coding.java.command-execution
+    languages: [java]
+    severity: ERROR
+    message: >-
+      A process is executed with a concatenated command string. Runtime.exec with
+      a single string performs its own tokenisation, and any externally
+      influenced component becomes command injection.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-78"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-78. The single-string form of Runtime.exec is the dangerous one; the
+        array form avoids shell-style parsing entirely.
+      remediation: >-
+        Use ProcessBuilder with an argument list and validate each component
+        against an allow-list.
+    pattern-either:
+      - pattern: Runtime.getRuntime().exec($A + $B)
+      - pattern: Runtime.getRuntime().exec(String.format(...))
+      - pattern: new ProcessBuilder($A + $B)
+
+  - id: devsecops-framework.secure-coding.java.insecure-deserialization
+    languages: [java]
+    severity: ERROR
+    message: >-
+      Java native deserialization of a stream. readObject on attacker-controlled
+      data yields remote code execution through widely published gadget chains.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-502"
+      owasp: "A08:2021 Software and Data Integrity Failures"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-502. Java deserialization gadget chains are the best-documented
+        instance of this vulnerability class in any ecosystem. Confidence is
+        MEDIUM because the stream source cannot be established in a single file.
+      remediation: >-
+        Use a data format that does not instantiate arbitrary types (JSON with
+        an explicit schema). If native serialization is required, apply a
+        serialization filter with an allow-list.
+    pattern-either:
+      - pattern: new ObjectInputStream(...).readObject()
+      - pattern: $OIS.readObject()
+      - pattern: new XMLDecoder(...).readObject()
+
+  - id: devsecops-framework.secure-coding.java.trust-all-certificates
+    languages: [java]
+    severity: ERROR
+    message: >-
+      A TrustManager accepts every certificate. TLS then provides encryption
+      without authentication, so an active attacker can intercept transparently.
+    metadata:
+      category: tls
+      cwe: "CWE-295"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-295. An X509TrustManager with empty check methods is the classic
+        "trust everything" implementation -- added to silence a development
+        certificate error and rarely removed.
+      remediation: >-
+        Remove the custom TrustManager. Import the internal CA into the
+        truststore instead.
+    pattern-either:
+      - pattern: |
+          public void checkServerTrusted(X509Certificate[] $C, String $A) { }
+      - pattern: |
+          public void checkClientTrusted(X509Certificate[] $C, String $A) { }
+      - pattern: |
+          $HV = new HostnameVerifier() { public boolean verify(String $H, SSLSession $S) { return true; } };
+
+  - id: devsecops-framework.secure-coding.java.weak-password-hash
+    languages: [java]
+    severity: ERROR
+    message: >-
+      A password is hashed with MD5 or SHA-1. Both are fast general-purpose
+      digests, which is the wrong property for credential storage.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-916"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-916. Keyed on the algorithm name; Java's MessageDigest API makes the
+        algorithm a string literal, which is reliably matchable. MEDIUM because
+        MD5 over a non-credential value is legitimate.
+      remediation: >-
+        Use BCryptPasswordEncoder or Argon2PasswordEncoder from Spring
+        Security, or PBKDF2 with a deliberate iteration count.
+    pattern-either:
+      - pattern: MessageDigest.getInstance("MD5")
+      - pattern: MessageDigest.getInstance("SHA1")
+      - pattern: MessageDigest.getInstance("SHA-1")
+
+  - id: devsecops-framework.secure-coding.java.csrf-disabled
+    languages: [java]
+    severity: WARNING
+    message: >-
+      Spring Security CSRF protection is disabled. For a cookie-authenticated
+      application this re-enables cross-site request forgery on every
+      state-changing endpoint.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-352"
+      owasp: "A01:2021 Broken Access Control"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-352. Disabling CSRF is legitimate for a stateless token-authenticated
+        API and dangerous for a cookie-session application. Single-file analysis
+        cannot distinguish the two, so this is WARNING and asks for a decision
+        rather than asserting a defect.
+      remediation: >-
+        Leave CSRF enabled for cookie-based sessions. If the API is genuinely
+        stateless and token-authenticated, record that decision next to the call.
+    pattern-either:
+      - pattern: $HTTP.csrf().disable()
+      - pattern: $HTTP.csrf(AbstractHttpConfigurer::disable)
+      - pattern: $HTTP.csrf($C -> $C.disable())

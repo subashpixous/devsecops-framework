@@ -1,0 +1,251 @@
+# Secure-coding patterns -- JavaScript / TypeScript (Node, Express, browser)
+#
+# `languages: [js, ts]` covers .js/.jsx/.mjs/.cjs/.ts/.tsx in the engine, so
+# these rules apply to both server and browser code in one file. Rules whose
+# destination is an HTTP response are Node/Express-shaped; DOM rules are
+# browser-shaped. Both are declared here because a single repository routinely
+# contains both.
+
+rules:
+  - id: devsecops-framework.secure-coding.javascript.error-message-to-response
+    languages: [js, ts]
+    severity: ERROR
+    message: >-
+      An error message or stack is sent in an HTTP response. Node error text
+      carries absolute paths, module versions and database driver detail;
+      err.stack additionally discloses the full call chain.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: HIGH
+      rationale: >-
+        CWE-209. Requires the error value to reach a response method, so
+        `console.error(err)` and `logger.error(err)` are correctly not flagged.
+      remediation: >-
+        Send a generic message plus a correlation id; log the error server-side.
+    patterns:
+      - pattern-either:
+          - pattern: $RES.send($ERR.message)
+          - pattern: $RES.send($ERR.stack)
+          - pattern: '$RES.json({..., $K: $ERR.message, ...})'
+          - pattern: '$RES.json({..., $K: $ERR.stack, ...})'
+          - pattern: $RES.status(...).send($ERR.message)
+          - pattern: '$RES.status(...).json({..., $K: $ERR.message, ...})'
+          - pattern: '$RES.status(...).json({..., $K: $ERR.stack, ...})'
+          - pattern: $RES.send(`...${$ERR.message}...`)
+          - pattern: $RES.end($ERR.stack)
+      - metavariable-regex:
+          metavariable: $ERR
+          regex: (?i)^(err|error|e|ex|exception)$
+
+  - id: devsecops-framework.secure-coding.javascript.dom-xss-sink
+    languages: [js, ts]
+    severity: ERROR
+    message: >-
+      A dynamic value is written to a DOM sink that parses HTML. If the value
+      contains attacker-controlled content this executes script in the victim's
+      session.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-79"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-79. innerHTML/outerHTML/insertAdjacentHTML parse and execute markup;
+        assigning a non-literal to them is the standard DOM-XSS shape. Confidence
+        MEDIUM because the value may be developer-controlled -- which single-file
+        analysis cannot confirm.
+      remediation: >-
+        Use textContent for text. Where HTML is genuinely required, sanitise with
+        DOMPurify before assignment.
+    pattern-either:
+      - pattern: $EL.innerHTML = $X
+      - pattern: $EL.outerHTML = $X
+      - pattern: $EL.insertAdjacentHTML($POS, $X)
+      - pattern: document.write($X)
+      - pattern: document.writeln($X)
+      - pattern: $EL.innerHTML = `...${$X}...`
+
+  - id: devsecops-framework.secure-coding.javascript.dynamic-code-execution
+    languages: [js, ts]
+    severity: ERROR
+    message: >-
+      Dynamic code execution via eval, the Function constructor, or a string
+      passed to setTimeout/setInterval. All of these execute their argument as
+      code.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-95"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-95. The Function constructor and string-form timers are eval in
+        disguise and are frequently missed in review because they do not contain
+        the word "eval".
+      remediation: >-
+        Use JSON.parse for data and a dispatch object for behaviour. Pass a
+        function reference, never a string, to setTimeout/setInterval.
+    pattern-either:
+      - pattern: eval($X)
+      - pattern: new Function($X)
+      - pattern: Function($X)()
+      - pattern: setTimeout(`...${$X}...`, ...)
+      - pattern: setInterval(`...${$X}...`, ...)
+
+  - id: devsecops-framework.secure-coding.javascript.command-execution
+    languages: [js, ts]
+    severity: ERROR
+    message: >-
+      A shell command is executed from a constructed string. child_process.exec
+      spawns a shell, so any externally influenced component becomes command
+      injection.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-78"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-78. exec/execSync invoke a shell; execFile and spawn with an argument
+        array do not. The rule targets the shell-invoking forms with a non-literal
+        command.
+      remediation: >-
+        Use execFile or spawn with an argument array so no shell parsing occurs.
+    pattern-either:
+      - pattern: $CP.exec(`...${$X}...`, ...)
+      - pattern: $CP.exec($A + $B, ...)
+      - pattern: $CP.execSync(`...${$X}...`, ...)
+      - pattern: $CP.execSync($A + $B, ...)
+      - pattern: require("child_process").exec(`...${$X}...`, ...)
+
+  - id: devsecops-framework.secure-coding.javascript.tls-verification-disabled
+    languages: [js, ts]
+    severity: ERROR
+    message: >-
+      TLS certificate verification is disabled process-wide or per-request.
+      NODE_TLS_REJECT_UNAUTHORIZED=0 disables it for every connection the process
+      makes, not just the one being debugged.
+    metadata:
+      category: tls
+      cwe: "CWE-295"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-295. The process-wide form is especially dangerous because its blast
+        radius extends far beyond the call it was added for -- including calls to
+        payment and identity providers.
+      remediation: >-
+        Remove the setting. For an internal CA, supply it via NODE_EXTRA_CA_CERTS
+        or the `ca` option on the specific request.
+    pattern-either:
+      - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+      - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = 0
+      - pattern: |
+          {..., rejectUnauthorized: false, ...}
+      - pattern: |
+          {..., strictSSL: false, ...}
+
+  - id: devsecops-framework.secure-coding.javascript.jwt-verification-bypass
+    languages: [js, ts]
+    severity: ERROR
+    message: >-
+      A JWT is decoded without verification, or verification accepts the "none"
+      algorithm. jwt.decode performs no signature check at all -- using its
+      output for an authorization decision means trusting a token the caller
+      could have written.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-347"
+      owasp: "A07:2021 Identification and Authentication Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-347. jwt.decode is legitimate for reading a claim from a token
+        already verified elsewhere, but it is very commonly used as if it
+        verified. Allowing alg "none" is unambiguous forgery acceptance.
+      remediation: >-
+        Use jwt.verify with an explicit algorithms allow-list. Never include
+        "none".
+    pattern-either:
+      - pattern: jwt.decode($TOKEN)
+      - pattern: 'jwt.decode($TOKEN, {..., complete: true, ...})'
+      - pattern: 'jwt.verify($TOKEN, $KEY, {..., algorithms: ["none"], ...})'
+      - pattern: 'jwt.verify($TOKEN, $KEY, {..., algorithms: [..., "none", ...], ...})'
+
+  - id: devsecops-framework.secure-coding.javascript.cors-reflect-origin-with-credentials
+    languages: [js, ts]
+    severity: ERROR
+    message: >-
+      CORS is configured to allow any origin together with credentials. Any site
+      can then make authenticated cross-origin requests using the victim's
+      session cookies.
+    metadata:
+      category: cors
+      cwe: "CWE-942"
+      owasp: "A05:2021 Security Misconfiguration"
+      confidence: HIGH
+      rationale: >-
+        CWE-942. Reflecting the request Origin with credentials enabled is
+        functionally equivalent to a wildcard while bypassing the browser's
+        refusal of the literal wildcard-plus-credentials combination.
+      remediation: >-
+        Pass an explicit origin allow-list to the cors middleware.
+    pattern-either:
+      - pattern: 'cors({..., origin: true, ..., credentials: true, ...})'
+      - pattern: 'cors({..., credentials: true, ..., origin: true, ...})'
+      - pattern: 'cors({..., origin: "*", ..., credentials: true, ...})'
+      - pattern: |
+          $RES.setHeader("Access-Control-Allow-Origin", $REQ.headers.origin)
+
+  - id: devsecops-framework.secure-coding.javascript.path-traversal-sink
+    languages: [js, ts]
+    severity: WARNING
+    message: >-
+      A file path is built from a template literal or concatenation before a file
+      system call. If any component derives from a request, `../` traversal
+      escapes the intended directory.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-22"
+      owasp: "A01:2021 Broken Access Control"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-22. WARNING rather than ERROR because building paths from internal
+        constants is routine; only an externally influenced component is
+        dangerous, and that cannot be confirmed in a single file.
+      remediation: >-
+        Resolve the path and verify it remains under the intended root before
+        opening. Reject traversal rather than stripping it.
+    pattern-either:
+      - pattern: fs.readFile(`...${$X}...`, ...)
+      - pattern: fs.readFileSync(`...${$X}...`, ...)
+      - pattern: fs.createReadStream(`...${$X}...`, ...)
+      - pattern: fs.unlink(`...${$X}...`, ...)
+      - pattern: fs.writeFileSync($A + $B, ...)
+      - pattern: $RES.sendFile(`...${$X}...`, ...)
+      - pattern: $RES.download(`...${$X}...`, ...)
+
+  - id: devsecops-framework.secure-coding.javascript.open-redirect
+    languages: [js, ts]
+    severity: WARNING
+    message: >-
+      A redirect target is taken directly from request data. An open redirect
+      lends the application's domain reputation to a phishing destination and is
+      routinely used to bypass link filtering.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-601"
+      owasp: "A01:2021 Broken Access Control"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-601. The request object appearing directly inside a redirect call is
+        a strong signal; WARNING because a validated value may legitimately be
+        passed through a variable of the same shape.
+      remediation: >-
+        Validate the target against an allow-list of internal paths, or accept
+        only a relative path with no scheme or host.
+    pattern-either:
+      - pattern: $RES.redirect($REQ.query.$P)
+      - pattern: $RES.redirect($REQ.body.$P)
+      - pattern: $RES.redirect($REQ.params.$P)
+      - pattern: window.location = $LOC.search
+      - pattern: window.location.href = $LOC.hash

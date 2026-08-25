@@ -241,6 +241,33 @@ jobs:
                    enrichment["epss_status"], enrichment["kev_status"]))
           PY
 
+      - name: Validate the secure-coding rule pack against its fixtures
+        # This is the ONLY place the framework's own rules are executed by a real
+        # engine. The authoring environment is Windows, where Semgrep does not
+        # run, so rule FIRING cannot be verified there -- only rule SCHEMA can.
+        # Without this gate the pack would ship on the strength of "the YAML
+        # parses", which is not evidence that a single rule matches anything.
+        #
+        # `semgrep --test` reads the `ruleid:` / `ok:` annotations in the fixture
+        # files and fails if a rule misses its vulnerable case OR fires on its
+        # safe case. The second half is the one that keeps the pack usable.
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet semgrep
+          semgrep --version
+
+          echo "--- rule schema (engine-independent) ---"
+          python - <<'PY'
+          from framework.core.rulepack import rule_inventory
+          inv = rule_inventory()
+          assert not inv["invalid_files"], inv["invalid_files"]
+          print("OK: %d rules across %d files, all schema-valid."
+                % (inv["total_rules"], inv["valid_files"]))
+          PY
+
+          echo "--- rule behaviour (fixtures, real engine) ---"
+          semgrep --test --config framework/rules/ framework/rules/
+
       - name: Verify a stale SonarQube analysis can never reach PASS
         run: |
           set -euo pipefail

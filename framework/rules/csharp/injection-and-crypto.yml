@@ -1,0 +1,250 @@
+# Injection, transport and cryptography defects -- C# / .NET
+#
+# Scope note: these are single-file, structural patterns. They do NOT constitute
+# taint analysis, and this pack does not pretend otherwise. A SQL injection where
+# the untrusted value arrives through three method calls is invisible here and is
+# reported as such in the coverage model. What these rules catch is the version
+# of the defect that is visible in one place -- which, in practice, is a large
+# share of what exists in real codebases.
+
+rules:
+  - id: devsecops-framework.secure-coding.csharp.sql-string-concatenation
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      A SQL command is built by string concatenation or interpolation. If any
+      concatenated value originates from a request, this is SQL injection. Use
+      parameterised queries; concatenation is never necessary for values.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-89"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-89. Confidence is MEDIUM, not HIGH, because the concatenated value
+        may be a constant. It is still reported: a parameterised query is
+        correct regardless, and concatenation next to a SqlCommand is the shape
+        every real injection takes.
+      remediation: >-
+        Use SqlCommand parameters (`cmd.Parameters.AddWithValue`) or an ORM.
+        Never concatenate or interpolate values into SQL text.
+    pattern-either:
+      - pattern: new SqlCommand($"...{$X}...", ...)
+      - pattern: new SqlCommand($A + $B, ...)
+      - pattern: new $CMD($"...SELECT...{$X}...", ...)
+      - pattern: |
+          $CMD.CommandText = $"...{$X}...";
+      - pattern: |
+          $CMD.CommandText = $A + $B;
+      - pattern: $CTX.Database.ExecuteSqlRaw($"...{$X}...", ...)
+      - pattern: $CTX.Database.ExecuteSqlRaw($A + $B, ...)
+      - pattern: $CTX.$SET.FromSqlRaw($"...{$X}...", ...)
+
+  - id: devsecops-framework.secure-coding.csharp.command-execution-from-variable
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      A process is started with arguments built from a variable. If any part
+      derives from user input this is command injection.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-78"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-78. Process.Start with a constant is fine; with an interpolated or
+        concatenated argument it is the standard command-injection shape.
+      remediation: >-
+        Pass arguments through ProcessStartInfo.ArgumentList so the OS performs
+        no shell parsing. Validate against an allow-list.
+    pattern-either:
+      - pattern: System.Diagnostics.Process.Start($"...{$X}...", ...)
+      - pattern: Process.Start($"...{$X}...", ...)
+      - pattern: Process.Start($A + $B, ...)
+      - pattern: |
+          $PSI.Arguments = $"...{$X}...";
+      - pattern: |
+          $PSI.Arguments = $A + $B;
+
+  - id: devsecops-framework.secure-coding.csharp.certificate-validation-disabled
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      TLS certificate validation is disabled. Every HTTPS connection made through
+      this client is trivially interceptable; the transport provides encryption
+      with no authentication, which is not meaningfully better than plaintext
+      against an active attacker.
+    metadata:
+      category: tls
+      cwe: "CWE-295"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-295. A callback returning a bare `true` accepts every certificate
+        including attacker-issued ones. This is high precision -- there is no
+        legitimate production use, and it is commonly introduced to silence a
+        development certificate error and never removed.
+      remediation: >-
+        Remove the override. For a self-signed development certificate, trust
+        that specific certificate in the development environment only.
+    pattern-either:
+      - pattern: |
+          ServicePointManager.ServerCertificateValidationCallback += (...) => true;
+      - pattern: |
+          ServicePointManager.ServerCertificateValidationCallback = (...) => true;
+      - pattern: |
+          $HANDLER.ServerCertificateCustomValidationCallback = (...) => true;
+      - pattern: |
+          $HANDLER.ServerCertificateCustomValidationCallback =
+              HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+
+  - id: devsecops-framework.secure-coding.csharp.weak-hash-for-password
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      A fast general-purpose hash is used where the variable naming indicates a
+      password. MD5, SHA-1 and unsalted SHA-256 are designed to be fast, which is
+      precisely the wrong property for password storage.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-916"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-916. The rule keys on password-shaped identifiers rather than on the
+        hash algorithm alone, because SHA-256 over a file checksum is entirely
+        correct and must not be flagged. This narrows it to the case that
+        matters at the cost of missing oddly-named variables.
+      remediation: >-
+        Use ASP.NET Core Identity's PasswordHasher, or PBKDF2 / bcrypt / scrypt /
+        Argon2 with a per-user salt and a deliberate work factor.
+    patterns:
+      - pattern-either:
+          - pattern: MD5.Create().ComputeHash($PWD)
+          - pattern: SHA1.Create().ComputeHash($PWD)
+          - pattern: SHA256.Create().ComputeHash($PWD)
+          - pattern: new MD5CryptoServiceProvider().ComputeHash($PWD)
+          - pattern: new SHA1CryptoServiceProvider().ComputeHash($PWD)
+      - metavariable-regex:
+          metavariable: $PWD
+          regex: (?i).*(pass|pwd|secret|credential).*
+
+  - id: devsecops-framework.secure-coding.csharp.insecure-deserialization
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      BinaryFormatter or an equivalent unsafe deserializer is used. Deserializing
+      attacker-controlled data with these APIs yields remote code execution
+      through gadget chains; Microsoft has formally deprecated BinaryFormatter
+      for this reason.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-502"
+      owasp: "A08:2021 Software and Data Integrity Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-502. High precision because the API itself is the defect -- there is
+        no safe way to use BinaryFormatter on untrusted input, and Microsoft's
+        own guidance is to stop using it entirely.
+      remediation: >-
+        Use System.Text.Json or a contract-based serializer. If polymorphic
+        deserialization is genuinely required, bind to an explicit allow-list of
+        types.
+    pattern-either:
+      - pattern: new BinaryFormatter().Deserialize(...)
+      - pattern: $BF.Deserialize(...)
+      - pattern: new SoapFormatter().Deserialize(...)
+      - pattern: new NetDataContractSerializer().Deserialize(...)
+      - pattern: |
+          JsonConvert.DeserializeObject(..., new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.All, ... })
+
+  - id: devsecops-framework.secure-coding.csharp.jwt-validation-disabled
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      JWT validation is switched off. A token whose issuer, audience, lifetime or
+      signature is not validated is not an authentication credential -- it is an
+      attacker-supplied claim the application has agreed to believe.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-347"
+      owasp: "A07:2021 Identification and Authentication Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-347. Explicit `false` on a TokenValidationParameters property is
+        unambiguous and carries no legitimate production use. Signature
+        validation disabled is the most severe of the set -- it makes forgery
+        trivial rather than merely easier.
+      remediation: >-
+        Set ValidateIssuer, ValidateAudience, ValidateLifetime and
+        ValidateIssuerSigningKey to true and supply the corresponding values.
+    pattern-either:
+      - pattern: |
+          new TokenValidationParameters { ..., ValidateIssuerSigningKey = false, ... }
+      - pattern: |
+          new TokenValidationParameters { ..., ValidateIssuer = false, ... }
+      - pattern: |
+          new TokenValidationParameters { ..., ValidateAudience = false, ... }
+      - pattern: |
+          new TokenValidationParameters { ..., ValidateLifetime = false, ... }
+      - pattern: |
+          $TVP.RequireSignedTokens = false;
+
+  - id: devsecops-framework.secure-coding.csharp.cors-any-origin-with-credentials
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      CORS is configured to allow any origin together with credentials. This
+      combination lets any website on the internet issue authenticated requests
+      to this API using the victim's session.
+    metadata:
+      category: cors
+      cwe: "CWE-942"
+      owasp: "A05:2021 Security Misconfiguration"
+      confidence: HIGH
+      rationale: >-
+        CWE-942. Either setting alone can be defensible; together they remove
+        the same-origin protection that browser session cookies depend on.
+        Browsers reject the literal combination, so implementations often
+        reflect the Origin header instead -- which is the same defect with extra
+        steps.
+      remediation: >-
+        Replace AllowAnyOrigin with WithOrigins listing exact origins. Never
+        reflect an arbitrary Origin header while allowing credentials.
+    pattern-either:
+      - pattern: |
+          $B.AllowAnyOrigin().AllowCredentials()
+      - pattern: |
+          $B.AllowCredentials().AllowAnyOrigin()
+      - pattern: |
+          $B.SetIsOriginAllowed(_ => true).AllowCredentials()
+      - pattern: |
+          $B.AllowCredentials().SetIsOriginAllowed(_ => true)
+
+  - id: devsecops-framework.secure-coding.csharp.path-from-request-concatenation
+    languages: [csharp]
+    severity: WARNING
+    message: >-
+      A file system path is built by concatenating or interpolating a variable.
+      If the value originates from a request, `../` traversal reaches files
+      outside the intended directory.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-22"
+      owasp: "A01:2021 Broken Access Control"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-22. Reported at WARNING rather than ERROR because Path.Combine with
+        internal constants is entirely normal; the pattern is only dangerous
+        when a component is externally influenced, which single-file analysis
+        cannot confirm.
+      remediation: >-
+        Resolve the combined path, then verify it still sits under the intended
+        root directory before opening it. Reject rather than sanitise.
+    pattern-either:
+      - pattern: File.ReadAllText($"...{$X}...")
+      - pattern: File.ReadAllBytes($"...{$X}...")
+      - pattern: File.OpenRead($"...{$X}...")
+      - pattern: File.WriteAllText($"...{$X}...", ...)
+      - pattern: File.Delete($"...{$X}...")
+      - pattern: new FileStream($A + $B, ...)

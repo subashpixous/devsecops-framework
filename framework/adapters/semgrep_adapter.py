@@ -13,11 +13,22 @@ from typing import Any, Dict, List
 
 from ..collectors.base import ScannerResult
 from ..core.context import RunContext
+from ..core.rulepack import RULE_ID_PREFIX
 from ..core.schema import Finding, normalise_severity
 from .base import Adapter
 
 TOOL = "semgrep"
 CATEGORY_KEY = "sast_semgrep"
+
+# Normalized finding categories a framework rule may declare. Constrained to the
+# set the policy already scores, so a typo in a rule's metadata cannot invent a
+# category the status engine has never heard of and silently drop it out of
+# threshold evaluation.
+KNOWN_CATEGORIES = {
+    "sast_finding", "information_disclosure", "sensitive_data_exposure",
+    "misconfiguration", "tls", "cors", "secret", "exposed_surface",
+    "security_header", "cookie_security", "vulnerability",
+}
 
 # Semgrep severity vocabulary -> canonical scale.
 SEVERITY_MAP = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
@@ -100,16 +111,36 @@ class SemgrepAdapter(Adapter):
         # extra.lines (matched source) intentionally omitted -- see module docstring.
 
         references = _as_list(metadata.get("references"))[:3]
-        remediation = (
-            "Review the Semgrep rule %s and apply the fix it describes in application code."
-            % (rule or "<unknown>")
-        )
+
+        # Framework-owned rules carry their own remediation and rationale, written
+        # for this report rather than for a rule catalogue. Prefer them: "apply the
+        # fix the rule describes" is useless advice when we wrote the rule and can
+        # simply say what the fix is.
+        framework_rule = bool(rule) and str(rule).startswith(RULE_ID_PREFIX)
+        rule_remediation = str(metadata.get("remediation") or "").strip()
+        if framework_rule and rule_remediation:
+            remediation = rule_remediation
+        else:
+            remediation = (
+                "Review the Semgrep rule %s and apply the fix it describes in application code."
+                % (rule or "<unknown>")
+            )
         if references:
             remediation += " References: %s" % ", ".join(references)
 
+        # A framework rule declares which normalized category it belongs to, so an
+        # information-disclosure rule is filed as information_disclosure rather
+        # than swept into the generic SAST bucket.
+        declared_category = str(metadata.get("category") or "").strip().lower()
+        category = (
+            declared_category
+            if framework_rule and declared_category in KNOWN_CATEGORIES
+            else "sast_finding"
+        )
+
         finding = Finding(
             tool=engine,
-            category="sast_finding",
+            category=category,
             severity=severity,
             raw_severity=str(raw_severity),
             cwe=_extract_cwe(metadata),
@@ -119,14 +150,25 @@ class SemgrepAdapter(Adapter):
             evidence=" | ".join(evidence_parts),
             description=message,
             impact=(
-                "Semgrep matched a pattern associated with this weakness class. Confidence is "
-                "%s; verify reachability from untrusted input before prioritising."
-                % (confidence or "not stated")
+                str(metadata.get("rationale") or "").strip()
+                if framework_rule and metadata.get("rationale")
+                else (
+                    "Semgrep matched a pattern associated with this weakness class. Confidence is "
+                    "%s; verify reachability from untrusted input before prioritising."
+                    % (confidence or "not stated")
+                )
             ),
             remediation=remediation,
             rule=rule,
             native_id=str(extra.get("fingerprint") or ""),
-            tags=[str(metadata.get("category"))] if metadata.get("category") else [],
+            tags=(
+                ([str(metadata.get("category"))] if metadata.get("category") else [])
+                # An explicit origin tag. The engine is still Semgrep/OpenGrep --
+                # we own the rule, not the matcher -- so the tool field stays
+                # accurate while the report can still attribute the rule to the
+                # framework's own pack.
+                + (["framework-secure-coding"] if framework_rule else [])
+            ),
             component=path,
             phase=2,
             scanner_category=CATEGORY_KEY,

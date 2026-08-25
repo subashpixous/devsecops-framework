@@ -1,0 +1,305 @@
+# Secure-coding patterns -- PHP
+#
+# PHP carries a distinct risk profile: superglobals put untrusted input in scope
+# everywhere, include/require accepts a runtime path, and several dangerous
+# functions are one keyword long. These rules key on the superglobals directly,
+# which raises precision considerably -- when $_GET appears inside a query
+# string, no data-flow analysis is needed to know the value is externally
+# controlled.
+
+rules:
+  - id: devsecops-framework.secure-coding.php.sql-injection-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value is concatenated or interpolated directly into a SQL
+      statement. This is SQL injection -- the value is externally controlled by
+      definition.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-89"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-89. This is one of the few genuinely HIGH-confidence single-file
+        injection rules available in any language: a superglobal inside query
+        text needs no taint analysis to establish that the input is untrusted.
+      remediation: >-
+        Use prepared statements with bound parameters (PDO::prepare with
+        execute, or mysqli_prepare with bind_param).
+    pattern-either:
+      - pattern: mysqli_query($CONN, "...$_GET[...]...")
+      - pattern: mysqli_query($CONN, "...$_POST[...]...")
+      - pattern: mysqli_query($CONN, "...$_REQUEST[...]...")
+      - pattern: mysqli_query($CONN, "...$_COOKIE[...]...")
+      - pattern: $CONN->query("...$_GET[...]...")
+      - pattern: $CONN->query("...$_POST[...]...")
+      - pattern: $CONN->query("...$_REQUEST[...]...")
+      - pattern: mysql_query("...$_GET[...]...")
+      - pattern: mysql_query("...$_POST[...]...")
+      - pattern: $PDO->query("...$_GET[...]...")
+      - pattern: $PDO->exec("...$_POST[...]...")
+
+  - id: devsecops-framework.secure-coding.php.sql-string-concatenation
+    languages: [php]
+    severity: WARNING
+    message: >-
+      A SQL statement is built by concatenation. If any concatenated value comes
+      from a request this is SQL injection.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-89"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-89. Complements the superglobal rule for the very common case where
+        the request value has first been assigned to a local variable. WARNING
+        because the concatenated value may be internal.
+      remediation: >-
+        Use prepared statements with bound parameters.
+    pattern-either:
+      - pattern: mysqli_query($CONN, $A . $B)
+      - pattern: $CONN->query($A . $B)
+      - pattern: $PDO->query($A . $B)
+      - pattern: $PDO->exec($A . $B)
+
+  - id: devsecops-framework.secure-coding.php.xss-superglobal-echo
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value is echoed without escaping. This is reflected XSS -- the
+      attacker controls the value and it is rendered as markup.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-79"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-79. HIGH confidence for the same reason as the SQL rule: the
+        superglobal establishes the input is untrusted without needing taint
+        analysis.
+      remediation: >-
+        Escape on output with htmlspecialchars($value, ENT_QUOTES, 'UTF-8'), or
+        use a template engine that escapes by default.
+    pattern-either:
+      - pattern: echo $_GET[...];
+      - pattern: echo $_POST[...];
+      - pattern: echo $_REQUEST[...];
+      - pattern: echo $_COOKIE[...];
+      - pattern: print $_GET[...];
+      - pattern: print $_POST[...];
+      - pattern: echo "...$_GET[...]...";
+      - pattern: echo "...$_POST[...]...";
+      - pattern: printf(..., $_GET[...], ...);
+
+  - id: devsecops-framework.secure-coding.php.command-execution-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value reaches a command execution function. This is command
+      injection with no further conditions required.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-78"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-78. These functions pass their argument to a shell. With a
+        superglobal in the argument the defect is unambiguous and directly
+        exploitable.
+      remediation: >-
+        Avoid shell execution. Where unavoidable, use escapeshellarg on every
+        component and validate against an allow-list.
+    pattern-either:
+      - pattern: system("...$_GET[...]...")
+      - pattern: system("...$_POST[...]...")
+      - pattern: exec("...$_GET[...]...")
+      - pattern: exec("...$_POST[...]...")
+      - pattern: shell_exec("...$_GET[...]...")
+      - pattern: shell_exec("...$_POST[...]...")
+      - pattern: passthru("...$_GET[...]...")
+      - pattern: popen("...$_GET[...]...", ...)
+      - pattern: proc_open("...$_GET[...]...", ...)
+
+  - id: devsecops-framework.secure-coding.php.file-inclusion-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value is used in include or require. This is local file
+      inclusion, and with allow_url_include enabled it is remote file inclusion
+      -- in either case it leads to code execution.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-98"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-98. PHP-specific and severe: include executes whatever it loads, so
+        this is not merely a file-read primitive but arbitrary code execution.
+      remediation: >-
+        Map the request value to a fixed allow-list of file paths. Never pass a
+        request value to include or require, even after sanitisation.
+    pattern-either:
+      - pattern: include $_GET[...];
+      - pattern: include $_POST[...];
+      - pattern: include $_REQUEST[...];
+      - pattern: include_once $_GET[...];
+      - pattern: require $_GET[...];
+      - pattern: require_once $_GET[...];
+      - pattern: include "...$_GET[...]...";
+      - pattern: require "...$_GET[...]...";
+
+  - id: devsecops-framework.secure-coding.php.path-traversal-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value is used to build a file system path. `../` traversal in the
+      value reaches files outside the intended directory, including
+      configuration files containing database credentials.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-22"
+      owasp: "A01:2021 Broken Access Control"
+      confidence: HIGH
+      rationale: >-
+        CWE-22. In PHP this is frequently the path from an unauthenticated
+        endpoint to database credentials, because config files usually sit one
+        directory above the web root.
+      remediation: >-
+        Resolve with realpath and verify the result is inside the intended
+        directory. Reject traversal rather than stripping it.
+    pattern-either:
+      - pattern: file_get_contents("...$_GET[...]...")
+      - pattern: file_get_contents($_GET[...])
+      - pattern: fopen("...$_GET[...]...", ...)
+      - pattern: fopen($_GET[...], ...)
+      - pattern: readfile("...$_GET[...]...")
+      - pattern: readfile($_GET[...])
+      - pattern: unlink($_GET[...])
+      - pattern: file_put_contents("...$_GET[...]...", ...)
+
+  - id: devsecops-framework.secure-coding.php.dynamic-code-execution
+    languages: [php]
+    severity: ERROR
+    message: >-
+      Dynamic code execution. eval, assert on a string, and preg_replace with the
+      /e modifier all execute their argument as PHP.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-95"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-95. eval with a superglobal is immediate remote code execution. The
+        /e modifier is a legacy form that is easy to miss in review.
+      remediation: >-
+        Remove eval. Use a dispatch array for behaviour selection and
+        preg_replace_callback instead of the /e modifier.
+    pattern-either:
+      - pattern: eval($_GET[...]);
+      - pattern: eval($_POST[...]);
+      - pattern: eval("...$_GET[...]...");
+      - pattern: eval("...$_POST[...]...");
+      - pattern: assert($_GET[...]);
+      - pattern: create_function(..., $_GET[...])
+
+  - id: devsecops-framework.secure-coding.php.unserialize-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value is unserialized. PHP object injection via magic methods
+      such as __wakeup and __destruct can escalate to remote code execution
+      through gadget chains.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-502"
+      owasp: "A08:2021 Software and Data Integrity Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-502. unserialize on untrusted input is unconditionally unsafe in PHP
+        -- exploitability depends only on which classes happen to be loaded.
+      remediation: >-
+        Use json_decode for untrusted data. If unserialize is unavoidable, pass
+        `['allowed_classes' => false]`.
+    pattern-either:
+      - pattern: unserialize($_GET[...])
+      - pattern: unserialize($_POST[...])
+      - pattern: unserialize($_COOKIE[...])
+      - pattern: unserialize($_REQUEST[...])
+
+  - id: devsecops-framework.secure-coding.php.exception-message-echoed
+    languages: [php]
+    severity: ERROR
+    message: >-
+      An exception message is echoed to the response. PDO and mysqli exception
+      text contains SQL fragments, table names and connection details.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: HIGH
+      rationale: >-
+        CWE-209. Echoing the exception is the standard PHP debugging habit that
+        reaches production; the disclosed SQL fragment is exactly what an
+        attacker needs to refine an injection attempt.
+      remediation: >-
+        Log the exception with error_log and display a generic message.
+    pattern-either:
+      - pattern: echo $E->getMessage();
+      - pattern: echo "...", $E->getMessage(), "...";
+      - pattern: echo "...{$E->getMessage()}...";
+      - pattern: print $E->getMessage();
+      - pattern: die($E->getMessage());
+      - pattern: exit($E->getMessage());
+      - pattern: echo $E->getTraceAsString();
+
+  - id: devsecops-framework.secure-coding.php.weak-password-hash
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A password is hashed with MD5 or SHA-1. Both are fast by design, which
+      makes offline brute force cheap; neither is salted by default.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-916"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-916. Keyed on password-shaped identifiers so md5 over a file
+        checksum is not flagged. PHP has had password_hash built in since 5.5,
+        so there is no remaining justification for md5 on credentials.
+      remediation: >-
+        Use password_hash with PASSWORD_DEFAULT and verify with
+        password_verify.
+    patterns:
+      - pattern-either:
+          - pattern: md5($PWD)
+          - pattern: sha1($PWD)
+          - pattern: hash("md5", $PWD)
+          - pattern: hash("sha1", $PWD)
+      - metavariable-regex:
+          metavariable: $PWD
+          regex: (?i).*(pass|pwd|secret|credential).*
+
+  - id: devsecops-framework.secure-coding.php.tls-verification-disabled
+    languages: [php]
+    severity: ERROR
+    message: >-
+      cURL TLS verification is disabled. The connection is encrypted but
+      unauthenticated and can be transparently intercepted.
+    metadata:
+      category: tls
+      cwe: "CWE-295"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-295. Setting VERIFYPEER to false is explicit and has no legitimate
+        production use; it is the standard workaround for a local certificate
+        error that then ships.
+      remediation: >-
+        Remove the override and supply a correct CA bundle via CURLOPT_CAINFO.
+    pattern-either:
+      - pattern: curl_setopt($CH, CURLOPT_SSL_VERIFYPEER, false);
+      - pattern: curl_setopt($CH, CURLOPT_SSL_VERIFYPEER, 0);
+      - pattern: curl_setopt($CH, CURLOPT_SSL_VERIFYHOST, 0);
+      - pattern: curl_setopt_array($CH, [..., CURLOPT_SSL_VERIFYPEER => false, ...]);

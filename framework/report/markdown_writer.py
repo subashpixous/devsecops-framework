@@ -529,6 +529,63 @@ def render_markdown(
                     % ", ".join("`%s`" % _escape(t) for t in failed))
                 add("")
 
+        # --- Framework secure-coding rule pack ---------------------------
+        # Which of OUR OWN rules ran. A rule that exists but did not run is a
+        # control that was not exercised, and "no finding" from a rule that
+        # never executed must not read the same as "no finding" from one that
+        # did.
+        pack = {}
+        engine_completed = False
+        for scanner in report.get("scanners") or []:
+            declared = (scanner.get("metadata") or {}).get("secure_coding_rules")
+            if declared:
+                pack = declared
+                # Selecting a rule is not running it. If the engine that executes
+                # our rules did not complete, NOTHING in this pack was applied --
+                # and saying otherwise would be exactly the overclaim the rest of
+                # this report exists to prevent.
+                engine_completed = scanner.get("status") == "OK" and not scanner.get("errors")
+                break
+        if pack:
+            selected = pack.get("rules_executed_count", 0)
+            add("**Framework secure-coding rule pack**")
+            add("")
+            add("| Measure | Value |")
+            add("|---|---|")
+            add("| Rules applicable to this project | %d |" % selected)
+            add("| Rules NOT applicable | %d |" % pack.get("rules_skipped_count", 0))
+            add("| Detected languages | %s |"
+                % (_escape(", ".join(pack.get("detected_languages") or [])) or "none detected"))
+            add("| **Rules actually executed** | %s |" % (
+                "**%d**" % selected if engine_completed
+                else "**0 — the engine did not complete**"
+            ))
+            add("")
+            if not engine_completed:
+                add("> **No framework secure-coding rule ran in this scan.** The rules below were "
+                    "selected for this project, but the engine that executes them "
+                    "(Semgrep/OpenGrep) did not complete, so none was applied. Absence of "
+                    "findings from this pack is NOT evidence that these patterns are absent.")
+                add("")
+            add("%s" % _escape(pack.get("statement", "")))
+            add("")
+            skipped_files = pack.get("files_skipped") or []
+            if skipped_files:
+                add("| Rule set not applied | Reason |")
+                add("|---|---|")
+                for entry in skipped_files:
+                    add("| `%s/%s` | %s |" % (
+                        _escape(entry.get("directory", "")), _escape(entry.get("file", "")),
+                        _escape(entry.get("skip_reason", "")),
+                    ))
+                add("")
+            invalid_files = pack.get("files_invalid") or []
+            if invalid_files:
+                add("> **%d framework rule file(s) were EXCLUDED as invalid.** Their rules did "
+                    "not run. This is a defect in the framework, not in the scanned project."
+                    % len(invalid_files))
+                add("")
+
         not_analysed = coverage.get("not_analysed") or {}
         if not_analysed:
             add("| Reason not analysed | Files |")

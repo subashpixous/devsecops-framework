@@ -14,6 +14,7 @@ import os
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..core import scanpaths
+from ..core.rulepack import compose_configs, select_rules
 from ..core.registry import ScannerRegistration, register_scanner
 from ..core.toolrunner import accepted, run, tool_available, tool_version
 from .base import Collector, ScannerResult
@@ -132,15 +133,42 @@ class SemgrepCollector(Collector):
         binary: Optional[str] = None,
         languages: Optional[Sequence[str]] = None,
         include_dependencies: bool = False,
+        secure_coding_rules: bool = True,
+        replace_default_rules: bool = False,
     ) -> None:
         self.workspace = workspace
         self.languages = list(languages or ())
-        # SEMGREP_RULES lets a project pin its own ruleset without code changes.
-        override = config or os.environ.get("SEMGREP_RULES") or ""
-        self.configs = [c.strip() for c in override.split(",") if c.strip()] or \
-            resolve_configs(self.languages)
+
+        # --- Rule composition -------------------------------------------
+        # ADDITIVE by default. This used to be a replacement: `SEMGREP_RULES`
+        # overwrote the entire configuration, so a project adding one custom
+        # rule silently switched off p/security-audit and p/owasp-top-ten. A
+        # coverage loss disguised as a coverage gain is precisely the failure
+        # this framework exists to make impossible, so the mandatory security
+        # packs can now only be removed by an explicit, recorded opt-out.
+        project_override = config or os.environ.get("SEMGREP_RULES") or ""
+        project_configs = [c.strip() for c in project_override.split(",") if c.strip()]
+        self.replace_default_rules = bool(
+            replace_default_rules
+            or str(os.environ.get("SEMGREP_RULES_REPLACE", "")).strip().lower()
+            in ("1", "true", "yes")
+        )
+
+        base_configs = resolve_configs(self.languages)
+
+        # Framework-owned secure-coding rules, selected by detected language.
+        self.rule_selection = select_rules(
+            self.languages, enabled=bool(secure_coding_rules) and not self.replace_default_rules
+        )
+
+        self.configs, self.composition = compose_configs(
+            base_configs=base_configs,
+            framework_rule_paths=self.rule_selection.config_paths,
+            project_configs=project_configs,
+            replace_defaults=self.replace_default_rules,
+        )
         self.config = ",".join(self.configs)
-        self.config_source = "override" if override else "framework default (security packs)"
+        self.config_source = self.composition["mode"]
         self.timeout = timeout
         self.binary = binary or (TOOL if tool_available(TOOL) else "opengrep")
         # What this scan will and will not read, decided from the languages
@@ -154,6 +182,21 @@ class SemgrepCollector(Collector):
         result.metadata["engine"] = self.binary
         result.metadata["config"] = self.config
         result.metadata["config_source"] = self.config_source
+        # Which rule sources were combined, and whether the mandatory security
+        # packs were in force. A reader must be able to tell a scan that ran the
+        # full set from one that ran a project's narrowed selection.
+        result.metadata["rule_composition"] = self.composition
+        result.metadata["secure_coding_rules"] = self.rule_selection.to_dict()
+        if self.composition.get("warning"):
+            result.warn(self.composition["warning"])
+        for invalid in self.rule_selection.invalid:
+            # A malformed framework rule is our defect, not the project's. It is
+            # excluded from the scan so it cannot fail the whole invocation, and
+            # reported so it cannot pass unnoticed.
+            result.warn(
+                "Framework secure-coding rule file %s was EXCLUDED as invalid (%s). The rules it "
+                "contains did not run." % (invalid.path, invalid.error)
+            )
         result.metadata["languages"] = self.languages
         result.metadata["exclusions"] = self.exclusions.to_dict()
         # Declared reach, consumed by the file-level coverage manifest. Declaring
@@ -245,7 +288,9 @@ class SemgrepCollector(Collector):
         return result.succeed().finish()
 
 
-_KW = {"workspace", "config", "timeout", "binary", "languages", "include_dependencies"}
+_KW = {"workspace", "config", "timeout", "binary", "languages", "include_dependencies",
+    "secure_coding_rules", "replace_default_rules",
+}
 
 
 def _build_collector(**kwargs: Any) -> SemgrepCollector:

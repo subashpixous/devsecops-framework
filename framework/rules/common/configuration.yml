@@ -1,0 +1,119 @@
+# Language-independent configuration defects
+#
+# These rules run for EVERY project regardless of detected language, because the
+# files they inspect are configuration rather than source. That makes them the
+# only rules in this pack with no language gate -- and it makes precision
+# especially important, since they apply everywhere.
+#
+# `generic` mode matches text structurally rather than by grammar. It is the
+# right tool for config files and the wrong tool for source code, so nothing
+# here attempts to reason about program behaviour.
+#
+# DELIBERATE NON-GOAL
+# -------------------
+# This file does NOT attempt general secret detection. Gitleaks already scans the
+# whole tree AND the git history for that, with far better patterns and with
+# secret values stripped before they reach disk. Duplicating it here would add
+# noise, duplicate findings, and a second-rate implementation of a solved
+# problem. The rules below cover only configuration-shaped defects that a secret
+# scanner does not model.
+
+rules:
+  - id: devsecops-framework.secure-coding.common.debug-enabled-in-config
+    languages: [generic]
+    paths:
+      include:
+        - "*.env"
+        - ".env*"
+        - "*appsettings*.json"
+        - "*application*.properties"
+        - "*application*.yml"
+        - "*config*.php"
+        - "*settings*.py"
+    severity: WARNING
+    message: >-
+      Debug mode appears enabled in a committed configuration file. Debug modes
+      expose stack traces, environment contents and sometimes interactive
+      consoles. If this file is used for any deployed environment, the exposure
+      is live.
+    metadata:
+      category: misconfiguration
+      cwe: "CWE-489"
+      owasp: "A05:2021 Security Misconfiguration"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-489. Scoped to configuration file names so it does not fire on
+        source code or documentation. WARNING rather than ERROR because a
+        committed development configuration is legitimate -- the finding asks
+        which environments consume this file, which is a question worth asking.
+      remediation: >-
+        Drive debug from an environment variable that defaults to off. Never
+        commit a debug-enabled configuration used by a deployed environment.
+    pattern-either:
+      - pattern-regex: (?i)^\s*(APP_)?DEBUG\s*[:=]\s*(true|1|on)\s*$
+      - pattern-regex: (?i)^\s*"?DetailedErrors"?\s*:\s*true
+      - pattern-regex: (?i)^\s*display_errors\s*=\s*(on|1|true)\s*$
+
+  - id: devsecops-framework.secure-coding.common.tls-verification-disabled-in-config
+    languages: [generic]
+    paths:
+      include:
+        - "*.env"
+        - ".env*"
+        - "*appsettings*.json"
+        - "*application*.properties"
+        - "*application*.yml"
+        - "*.conf"
+        - "*.ini"
+    severity: ERROR
+    message: >-
+      TLS certificate verification appears disabled in configuration. Every
+      outbound connection governed by this setting is encrypted but
+      unauthenticated, and can be intercepted by an active attacker.
+    metadata:
+      category: tls
+      cwe: "CWE-295"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-295. Complements the per-language rules by catching the case where
+        verification is switched off through configuration rather than code --
+        which is invisible to a source-only rule and just as effective at
+        disabling the control.
+      remediation: >-
+        Remove the setting and install the correct CA certificate instead.
+    pattern-either:
+      - pattern-regex: (?i)^\s*NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*0\s*$
+      - pattern-regex: (?i)^\s*(ssl[_-]?verify|verify[_-]?ssl|tls[_-]?verify)\s*[:=]\s*(false|0|off|no)\s*$
+      - pattern-regex: (?i)^\s*curl\.cainfo\s*=\s*$
+
+  - id: devsecops-framework.secure-coding.common.wildcard-cors-in-config
+    languages: [generic]
+    paths:
+      include:
+        - "*.env"
+        - ".env*"
+        - "*appsettings*.json"
+        - "*application*.properties"
+        - "*application*.yml"
+        - "*.conf"
+    severity: WARNING
+    message: >-
+      A wildcard CORS origin is configured. Combined with credentialed requests
+      this removes the same-origin protection that session cookies rely on.
+    metadata:
+      category: cors
+      cwe: "CWE-942"
+      owasp: "A05:2021 Security Misconfiguration"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-942. A wildcard alone is acceptable for a genuinely public,
+        unauthenticated API, which is why this is WARNING. It becomes a serious
+        defect only alongside credentials -- a combination the per-language
+        rules detect directly in code.
+      remediation: >-
+        List exact allowed origins. Never combine a wildcard with credentialed
+        requests.
+    pattern-either:
+      - pattern-regex: (?i)^\s*Access-Control-Allow-Origin\s*[:=]\s*\*\s*$
+      - pattern-regex: (?i)^\s*(cors[_.]?allowed[_.]?origins|CORS_ORIGIN_ALLOW_ALL)\s*[:=]\s*(\*|true)\s*$
