@@ -27,8 +27,11 @@ function sql_injection_cases($conn, $safe_id, $pdo) {
     // this line as `incorrect` for sql-string-concatenation only because the
     // fixture declared one of the two. Corroboration is the intended behaviour,
     // so the fixture now declares both rather than one rule being narrowed.
-    // ruleid: devsecops-framework.secure-coding.php.sql-injection-superglobal
-    // ruleid: devsecops-framework.secure-coding.php.sql-string-concatenation
+    // Both ids share ONE annotation line: `ruleid:` applies to the line
+    // immediately below it, so stacking two annotations made the first one point
+    // at the second comment rather than at the code -- which is precisely what
+    // CI reported as `missed lines: [31], incorrect lines: [32]`.
+    // ruleid: devsecops-framework.secure-coding.php.sql-injection-superglobal, devsecops-framework.secure-coding.php.sql-string-concatenation
     $conn->query("SELECT * FROM users WHERE id = " . $_REQUEST['id']);
 
     // ok: devsecops-framework.secure-coding.php.sql-injection-superglobal
