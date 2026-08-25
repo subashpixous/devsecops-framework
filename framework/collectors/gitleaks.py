@@ -75,14 +75,6 @@ class GitleaksCollector(Collector):
     def collect(self) -> ScannerResult:
         result = self.new_result()
 
-        if not tool_available(TOOL):
-            return result.fail(
-                "gitleaks is not installed or not on PATH. Secret scanning did NOT run, "
-                "so this category is unverified."
-            ).finish()
-
-        result.metadata["version"] = tool_version(TOOL)
-
         is_git_repo = os.path.isdir(os.path.join(self.workspace, ".git"))
         mode = "git" if (self.scan_history and is_git_repo) else "dir"
         result.metadata["mode"] = mode
@@ -91,7 +83,24 @@ class GitleaksCollector(Collector):
         # exposed exactly as much as one committed at the root.
         plan = scanpaths.resolve(scanpaths.INTENT_SECRET)
         result.metadata["exclusions"] = plan.to_dict()
-        result.metadata["coverage"] = {"exclusions": plan.to_dict(), "extensions": []}
+        # Declared BEFORE the availability guard, deliberately. The census credits
+        # coverage only to a scan that completed, so declaring intent early cannot
+        # inflate anything -- but it lets the report state exactly how much
+        # coverage a missing gitleaks cost, instead of leaving it unquantified.
+        result.metadata["coverage"] = {
+            "exclusions": plan.to_dict(),
+            "extensions": [],
+            "unit": "repository files and git history",
+            "unit_detail": {"mode": mode, "git_history": bool(self.scan_history and is_git_repo)},
+        }
+
+        if not tool_available(TOOL):
+            return result.fail(
+                "gitleaks is not installed or not on PATH. Secret scanning did NOT run, "
+                "so this category is unverified."
+            ).finish()
+
+        result.metadata["version"] = tool_version(TOOL)
         if self.scan_history and not is_git_repo:
             result.partial(
                 "Workspace is not a git repository; git history was NOT scanned. "

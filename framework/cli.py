@@ -34,6 +34,9 @@ from .core.categories import PIPELINE_STAGES, SECURITY_FAILED, SECURITY_NOT_VERI
 from .core.context import RunContext
 from .core.lifecycle import apply_lifecycle, load_baseline, load_exceptions
 from .core.policy import Policy
+from .core.correlation import correlate
+from .core.evidence import build_manifest as build_evidence_manifest, write_manifest
+from .core.prioritization import enrich_findings
 from .core.coverage import build_manifest
 from .core.registry import (
     CATEGORY_BY_KEY,
@@ -102,6 +105,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated pipeline stages to execute (%s). Default: all." % ",".join(PIPELINE_STAGES),
     )
     run_parser.add_argument("--sonar-project-key", default="")
+    run_parser.add_argument(
+        "--max-analysis-age-days", type=int, default=0,
+        help="How old a SonarQube analysis may be before its results are reported as STALE "
+             "when no revision is available for comparison (0 = framework default, 7 days). "
+             "A revision match is authoritative at any age; a mismatch is stale at any age.",
+    )
     run_parser.add_argument("--build-status", default="")
     run_parser.add_argument("--deployment-status", default="")
     run_parser.add_argument("--images", default="", help="Comma-separated image refs for image/SBOM/signature scans.")
@@ -126,6 +135,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--include-dependencies", action="store_true",
         help="Also run static analysis over vendored dependency source (vendor/, node_modules/). "
              "Off by default; either way the choice is recorded in the coverage manifest.",
+    )
+    run_parser.add_argument(
+        "--no-enrichment", action="store_true",
+        help="Skip EPSS and CISA KEV lookups entirely. Both are third-party network calls; "
+             "without them findings carry no exploitability context and the report says so.",
+    )
+    run_parser.add_argument(
+        "--epss-file", default="",
+        help="Local EPSS JSON (offline/air-gapped runners) instead of the FIRST API.",
+    )
+    run_parser.add_argument(
+        "--kev-file", default="",
+        help="Local CISA KEV catalogue JSON instead of the live feed.",
+    )
+    run_parser.add_argument(
+        "--enrichment-timeout", type=int, default=15,
+        help="Seconds to wait for each enrichment source before giving up (default 15).",
     )
     run_parser.add_argument("--sonar-payload", default="", help="Self-test only: load a captured payload.")
     return parser
@@ -187,6 +213,11 @@ def _collect(
     kwargs: Dict[str, Any] = {
         "workspace": args.workspace,
         "branch": context.branch,
+        # The commit under validation. SonarQube is the one scanner whose results
+        # are produced elsewhere, so it needs this to prove the analysis it read
+        # describes THIS code rather than whatever was analysed last.
+        "commit": context.commit,
+        "max_analysis_age_days": args.max_analysis_age_days,
         "project_key": args.sonar_project_key or None,
         "images": _csv(args.images),
         "deployed_url": context.deployed_url,
@@ -377,6 +408,36 @@ def command_run(args: argparse.Namespace) -> int:  # noqa: C901 - linear orchest
            lifecycle.false_positive + lifecycle.accepted_risk, lifecycle.expired_exceptions)
     )
 
+    # --- CROSS-SCANNER CORRELATION ---------------------------------------
+    # Additive: nothing is merged or dropped. Two engines finding the same defect
+    # is stronger evidence than one, and it is recorded as such.
+    correlation = correlate(findings)
+    _log(
+        "correlation: %d defect(s) corroborated by more than one scanner, covering %d finding(s)"
+        % (len(correlation.corroborated_groups), correlation.findings_correlated)
+    )
+
+    # --- EXPLOITABILITY ENRICHMENT ---------------------------------------
+    # Deliberately applied AFTER lifecycle and BEFORE reporting, and deliberately
+    # not an input to the status engine below. Enrichment orders findings; it must
+    # never decide them, because a verdict that depends on a third-party API is a
+    # verdict that changes when that API has an outage.
+    enrichment = enrich_findings(
+        findings,
+        enable_epss=not args.no_enrichment,
+        enable_kev=not args.no_enrichment,
+        timeout=args.enrichment_timeout,
+        epss_file=args.epss_file,
+        kev_file=args.kev_file,
+    )
+    _log(
+        "enrichment: epss=%s kev=%s cves=%d scored=%d kev_matches=%d"
+        % (enrichment.epss_status, enrichment.kev_status, enrichment.cves_seen,
+           enrichment.cves_scored, enrichment.kev_matches)
+    )
+    if enrichment.epss_status == "EPSS_UNAVAILABLE" or enrichment.kev_status == "KEV_UNAVAILABLE":
+        _log("  %s" % enrichment.statement())
+
     assessment = StatusEngine(policy).evaluate(
         context=context,
         capabilities=capabilities,
@@ -407,6 +468,8 @@ def command_run(args: argparse.Namespace) -> int:  # noqa: C901 - linear orchest
     report = build_report(
         context, capabilities, policy, assessment, findings, results,
         file_coverage=file_coverage,
+        enrichment=enrichment.to_dict(),
+        correlation=correlation.to_dict(),
     )
 
     table_rows = args.max_table_rows or None
@@ -426,6 +489,16 @@ def command_run(args: argparse.Namespace) -> int:  # noqa: C901 - linear orchest
     except PdfGenerationError as exc:
         _log("ERROR: %s" % exc)
         return EXIT_FRAMEWORK_ERROR
+
+    # --- AUDIT EVIDENCE ---------------------------------------------------
+    # Written LAST, so it can hash every artefact this run actually produced.
+    # A report is an assertion; a report plus this manifest is a record.
+    manifest = build_evidence_manifest(
+        report, results, args.output, policy_paths=policy.source_paths,
+    )
+    _log("wrote %s" % write_manifest(manifest, args.output))
+    if not manifest.get("available"):
+        _log("WARNING: %s" % manifest.get("reason", "evidence manifest unavailable"))
 
     _write_step_summary(report)
     _write_outputs(report)

@@ -148,14 +148,66 @@ def render_markdown(
     gate = report.get("quality_gate") or {}
     add("---")
     add("")
-    add("## 5. SonarQube Quality Gate")
+    add("## 5. SonarQube Analysis")
     add("")
+
+    # Analysis identity FIRST. The gate verdict is only meaningful once the
+    # reader knows which code it describes, so the provenance of the result is
+    # stated before the result itself.
+    state = gate.get("analysis_state", "SONARQUBE_RESULT_UNAVAILABLE")
     add("| Field | Value |")
     add("|---|---|")
+    add("| Analysis state | **`%s`** |" % _escape(state))
+    add("| Project key | `%s` |" % _escape(gate.get("project_key", "NOT_ESTABLISHED")))
+    add("| Analysis date | `%s` |" % _escape(gate.get("analysis_date", "NOT_ESTABLISHED")))
+    add("| Analysis revision | `%s` |" % _escape(gate.get("analysis_revision", "NOT_ESTABLISHED")))
+    add("| Commit under validation | `%s` |" % _escape(gate.get("scanned_commit", "NOT_ESTABLISHED")))
+    add("| Freshness established by | `%s` |" % _escape(gate.get("freshness_basis", "unknown")))
+    add("| Scope | %s |" % _escape(gate.get("branch_scope", "NOT_ESTABLISHED")))
     add("| Gate status | **%s** |" % _escape(gate.get("status", "UNKNOWN")))
     add("| Conditions evaluated | %d |" % len(gate.get("conditions") or []))
     add("| Failing conditions | %d |" % len(gate.get("failing_conditions") or []))
     add("")
+
+    if state == "SONARQUBE_RESULT_STALE":
+        add("> **`SONARQUBE_RESULT_STALE` — these results do not describe the code in this run.**")
+        add(">")
+        add("> %s" % _escape(gate.get("analysis_state_reason", "")))
+        add(">")
+        add("> The findings below are reported for information. They are NOT evidence about "
+            "this commit, and this category cannot reach PASS on them.")
+        add("")
+    elif state == "SONARQUBE_PERMISSION_ERROR":
+        add("> **`SONARQUBE_PERMISSION_ERROR` — the analysis server rejected our credentials.**")
+        add(">")
+        add("> The token is invalid, expired, or lacks 'Browse' permission on this project. "
+            "No assertion about static analysis can be made from this run.")
+        add("")
+    elif state == "SONARQUBE_RESULT_UNAVAILABLE":
+        add("> **`SONARQUBE_RESULT_UNAVAILABLE` — no usable analysis was retrieved.** "
+            "This is NOT a pass.")
+        add("")
+    elif gate.get("freshness_basis") == "age":
+        add("> Freshness was established by analysis **age**, not by revision. The server "
+            "reported no revision for its last analysis, so it cannot be proven that the "
+            "analysis covered this exact commit.")
+        add("")
+
+    measures = gate.get("measures") or {}
+    if measures:
+        add("**Project measures**")
+        add("")
+        add("| Metric | Value |")
+        add("|---|---|")
+        for metric in ("ncloc", "files", "coverage", "line_coverage", "branch_coverage",
+                       "duplicated_lines_density", "vulnerabilities", "bugs",
+                       "code_smells", "security_hotspots"):
+            if metric in measures:
+                add("| %s | %s |" % (_escape(metric), _escape(measures[metric])))
+        add("")
+        add("> Metrics the server does not hold are omitted rather than shown as zero: a "
+            "project with no coverage measurement is not a project with 0% coverage.")
+        add("")
     if gate.get("conditions"):
         add("| Metric | Comparator | Threshold | Actual | Status |")
         add("|---|---|---|---|---|")
@@ -242,6 +294,75 @@ def render_markdown(
                 _escape(item.get("severity")), _escape(item.get("tool")),
                 _truncate(item.get("file"), 50), _truncate(item.get("description"), 70)))
         add("")
+
+    # --- Exploitability -------------------------------------------------------
+    add("---")
+    add("")
+    add("## 6.2 Exploitability (EPSS / CISA KEV)")
+    add("")
+    enrichment = report.get("enrichment") or {}
+    add("| Source | State |")
+    add("|---|---|")
+    add("| EPSS (exploit probability) | `%s` |" % _escape(enrichment.get("epss_status", "EPSS_DISABLED")))
+    add("| CISA KEV (known exploited) | `%s` |" % _escape(enrichment.get("kev_status", "KEV_DISABLED")))
+    add("")
+    add("%s" % _escape(enrichment.get("statement", "")))
+    add("")
+
+    if enrichment.get("kev_status") == "KEV_AVAILABLE":
+        kev_items = [f for f in findings["items"] if f.get("kev_listed")]
+        if kev_items:
+            add("### Known-exploited vulnerabilities present")
+            add("")
+            add("> These CVEs appear in CISA's catalogue of vulnerabilities with **confirmed "
+                "exploitation in the wild**. This is observed fact, not a prediction.")
+            add("")
+            add("| Severity | CVE | EPSS | Added to KEV | File | Description |")
+            add("|---|---|---|---|---|---|")
+            for item in kev_items[:50]:
+                score = item.get("epss_score")
+                add("| %s | %s | %s | %s | `%s` | %s |" % (
+                    _escape(item.get("severity")),
+                    _escape("; ".join(item.get("cve_ids") or [])),
+                    ("%.4f" % score) if isinstance(score, float) else "NOT_ESTABLISHED",
+                    _escape(item.get("kev_date_added", "")),
+                    _escape(_truncate(item.get("file"), 40)),
+                    _escape(_truncate(item.get("description"), 60)),
+                ))
+            add("")
+        else:
+            add("No finding in this run matches a vulnerability in the CISA KEV catalogue.")
+            add("")
+    else:
+        add("> Known-exploited status is **NOT_ESTABLISHED** for every finding in this run. "
+            "This is absence of data, not evidence that none of these findings is being "
+            "exploited.")
+        add("")
+
+    # --- Cross-scanner corroboration -----------------------------------------
+    correlation = report.get("correlation") or {}
+    groups = correlation.get("groups") or []
+    if groups:
+        add("---")
+        add("")
+        add("## 6.3 Cross-Scanner Corroboration")
+        add("")
+        add("%s" % _escape(correlation.get("statement", "")))
+        add("")
+        add("| File | CWE | Detected by | Lines | Severities |")
+        add("|---|---|---|---|---|")
+        for group in groups[:60]:
+            add("| `%s` | %s | **%s** | %s | %s |" % (
+                _escape(_truncate(group.get("file"), 44)),
+                _escape(group.get("cwe", "")),
+                _escape(" + ".join(group.get("tools") or [])),
+                _escape(", ".join(str(n) for n in group.get("lines") or [])),
+                _escape(", ".join(group.get("severities") or [])),
+            ))
+        add("")
+        for note in correlation.get("notes") or []:
+            add("> %s" % _escape(note))
+            add("")
 
     # --- Findings -------------------------------------------------------------
     add("---")
@@ -360,6 +481,53 @@ def render_markdown(
         add("")
         add("**%s**" % _escape(coverage.get("statement", "")))
         add("")
+
+        # --- Per-scanner reach ------------------------------------------
+        # The aggregate above answers "did anything miss every scanner?".
+        # This answers "what did THIS scanner actually look at?", which is the
+        # question asked whenever a finding is absent and someone needs to know
+        # whether it was ever looked for.
+        per_scanner = coverage.get("per_scanner") or []
+        if per_scanner:
+            add("**Coverage by scanner**")
+            add("")
+            add("| Scanner | Category | Status | Analysed | Excluded | Outside its file types | Not analysed |")
+            add("|---|---|---|---:|---:|---:|---:|")
+            for row in per_scanner:
+                if row.get("file_level", True):
+                    numbers = "%d | %d | %d | %d" % (
+                        row.get("analysed", 0), row.get("excluded", 0),
+                        row.get("outside_capability", 0), row.get("not_analysed", 0),
+                    )
+                else:
+                    # No declared file-level reach: the honest cell is "not
+                    # established", never a zero that reads as "nothing missed".
+                    numbers = "n/a | n/a | n/a | n/a"
+                add("| `%s` | `%s` | `%s` | %s |" % (
+                    _escape(row.get("tool", "")),
+                    _escape(row.get("category", "")),
+                    _escape(row.get("status", "")),
+                    numbers,
+                ))
+            add("")
+
+            for row in per_scanner:
+                add("- %s" % _escape(row.get("statement", "")))
+            add("")
+
+            unavailable = coverage.get("scanners_unavailable") or []
+            failed = coverage.get("scanners_failed") or []
+            if unavailable:
+                add("> **Scanners NOT AVAILABLE on this runner:** %s"
+                    % ", ".join("`%s`" % _escape(t) for t in unavailable))
+                add(">")
+                add("> Their categories are NOT_VERIFIED. Absence of findings from these "
+                    "scanners is not evidence that no such finding exists.")
+                add("")
+            if failed:
+                add("> **Scanners that did NOT complete:** %s"
+                    % ", ".join("`%s`" % _escape(t) for t in failed))
+                add("")
 
         not_analysed = coverage.get("not_analysed") or {}
         if not_analysed:

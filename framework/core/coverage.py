@@ -85,6 +85,23 @@ BUCKETS = (
 )
 
 
+# Why a scanner read nothing. Every scanner in the run gets exactly one of
+# these, so "this scanner analysed no files" is never left to interpretation.
+SCANNER_ANALYSED = "analysed"
+SCANNER_UNAVAILABLE = "scanner_unavailable"
+SCANNER_FAILED_TO_COMPLETE = "scanner_failed"
+SCANNER_NOT_APPLICABLE = "not_applicable"
+SCANNER_NO_DECLARATION = "coverage_not_declared"
+
+# Phrases a collector uses when the tool is absent. Matching on them lets the
+# census distinguish "the tool was not installed" from "the tool ran and broke",
+# which are different problems with different owners.
+_UNAVAILABLE_MARKERS = (
+    "is not installed", "not on path", "not available", "no binary",
+    "neither 'semgrep' nor 'opengrep'",
+)
+
+
 @dataclass
 class ScanCoverage:
     """One scanner's declared reach over the workspace.
@@ -98,14 +115,50 @@ class ScanCoverage:
     tool: str
     intent: str = ""
     completed: bool = False
+    # The category this scanner serves. Several collectors share a binary --
+    # Checkov backs three categories -- so the tool name alone does not identify
+    # a row, and three identical "checkov" lines tell the reader nothing.
+    category_key: str = ""
+    # Whether the collector declared a file-level reach at all. Without one, the
+    # number of files it "would have read" is unknowable, and this module states
+    # what it can prove rather than inventing a denominator.
+    declared: bool = False
     patterns: Tuple[str, ...] = ()
     # Extensions this scanner reads. Empty tuple means "every file".
     extensions: Tuple[str, ...] = ()
     vendored_skipped: Tuple[str, ...] = ()
+    # Why this scanner covered nothing, when it covered nothing.
+    status: str = SCANNER_ANALYSED
+    status_reason: str = ""
+    # Free-form reach for scanners whose unit is not a file -- git history,
+    # dependency manifests, a container image, a live URL.
+    unit: str = "files"
+    unit_detail: Dict[str, Any] = field(default_factory=dict)
+    # An authoritative list of the exact paths this scanner read, when the
+    # scanner can report one. A server that tells us precisely which files its
+    # analysis covered beats any inference from extensions and patterns, so when
+    # this is present it decides `reads()` on its own.
+    explicit_files: Optional[frozenset] = None
 
     def reads(self, relative_path: str, extension: str) -> bool:
         if not self.completed:
             return False
+        if self.explicit_files is not None:
+            return relative_path in self.explicit_files
+        if self.extensions and extension not in self.extensions:
+            return False
+        return not is_excluded(relative_path, self.patterns)
+
+    def would_read(self, relative_path: str, extension: str) -> bool:
+        """Reach the scanner claims, ignoring whether it actually completed.
+
+        The difference between `would_read` and `reads` is exactly the coverage
+        a failed or missing scanner cost this run, which is the number the
+        report needs in order to say "20 files were not analysed because the
+        scanner was unavailable".
+        """
+        if self.explicit_files is not None:
+            return relative_path in self.explicit_files
         if self.extensions and extension not in self.extensions:
             return False
         return not is_excluded(relative_path, self.patterns)
@@ -115,9 +168,13 @@ class ScanCoverage:
             "tool": self.tool,
             "intent": self.intent,
             "completed": self.completed,
+            "status": self.status,
+            "status_reason": self.status_reason,
             "excluded_patterns": list(self.patterns),
             "vendored_skipped": list(self.vendored_skipped),
             "reads_extensions": list(self.extensions) or "all",
+            "unit": self.unit,
+            "unit_detail": dict(self.unit_detail),
         }
 
 
@@ -130,31 +187,82 @@ def _extension(filename: str) -> str:
     return ext
 
 
-def scan_coverage_from_results(scanner_results: Sequence[Any]) -> List[ScanCoverage]:
-    """Read each scanner's declared reach off its ScannerResult.
+def _classify_scanner_status(result: Any, declared: bool) -> Tuple[str, str]:
+    """Why did this scanner cover what it covered?
 
-    A collector opts in by recording `metadata["coverage"]`. One that does not is
-    listed with `completed=False` and credited with nothing: an undeclared reach
-    is not evidence of reach.
+    The census exists to make missing coverage impossible to hide, and "nothing
+    was analysed" has four very different causes: the tool was absent, the tool
+    broke, the category did not apply, or the collector never declared its
+    reach. Each has a different owner and a different fix, so each is named.
+    """
+    status = str(getattr(result, "status", "") or "").upper()
+    errors = list(getattr(result, "errors", None) or ())
+    warnings = list(getattr(result, "warnings", None) or ())
+    blob = " ".join(errors + warnings).lower()
+
+    if getattr(result, "is_trustworthy", False):
+        if not declared:
+            return SCANNER_NO_DECLARATION, (
+                "The scanner completed but did not declare which files it read, so no file "
+                "may be credited to it."
+            )
+        return SCANNER_ANALYSED, "The scanner completed and declared its reach."
+
+    if status == "SKIPPED":
+        return SCANNER_NOT_APPLICABLE, (
+            warnings[0] if warnings else "The scanner was skipped for this project."
+        )
+    if any(marker in blob for marker in _UNAVAILABLE_MARKERS):
+        return SCANNER_UNAVAILABLE, (
+            errors[0] if errors else "The scanner binary was not available on this runner."
+        )
+    return SCANNER_FAILED_TO_COMPLETE, (
+        errors[0] if errors else "The scanner did not complete successfully."
+    )
+
+
+def scan_coverage_from_results(scanner_results: Sequence[Any]) -> List[ScanCoverage]:
+    """Read each scanner's reach off its ScannerResult.
+
+    Every scanner in the run gets an entry, including those that never ran. A
+    collector declares its reach by recording `metadata["coverage"]`; one that
+    does not is credited with nothing, because an undeclared reach is not
+    evidence of reach. But it still appears, with the reason it covered nothing
+    -- a scanner that vanishes from the census is exactly the silent gap this
+    module exists to prevent.
     """
     coverages: List[ScanCoverage] = []
     for result in scanner_results or ():
         metadata = getattr(result, "metadata", None) or {}
         declared = metadata.get("coverage")
-        if not isinstance(declared, dict):
-            continue
+        has_declaration = isinstance(declared, dict)
+        declared = declared if has_declaration else {}
+
         exclusions = declared.get("exclusions") or {}
         extensions = declared.get("extensions") or []
+        status, reason = _classify_scanner_status(result, has_declaration)
+
         coverages.append(
             ScanCoverage(
                 tool=getattr(result, "tool", "") or declared.get("tool", ""),
+                category_key=str(getattr(result, "category_key", "") or ""),
+                declared=has_declaration,
                 intent=str(exclusions.get("intent") or declared.get("intent") or ""),
                 # Only a fully trustworthy scan may be credited with coverage.
                 # PARTIAL means the tool itself said its reach was incomplete.
-                completed=bool(getattr(result, "is_trustworthy", False)),
+                completed=bool(getattr(result, "is_trustworthy", False)) and has_declaration,
                 patterns=tuple(exclusions.get("patterns") or ()),
                 extensions=tuple(str(e).lower() for e in extensions),
                 vendored_skipped=tuple(exclusions.get("vendored_skipped") or ()),
+                status=status,
+                status_reason=reason,
+                unit=str(declared.get("unit") or "files"),
+                unit_detail=dict(declared.get("unit_detail") or {}),
+                explicit_files=(
+                    frozenset(str(p).replace("\\", "/") for p in declared["files"])
+                    if isinstance(declared.get("files"), (list, tuple, set))
+                    else None
+                ),
             )
         )
     return coverages
@@ -310,6 +418,27 @@ def _build_manifest(
             % ", ".join(secret_scanned)
         )
 
+    # Per-scanner reach. Computed over every scanner in the run, including the
+    # ones that read nothing, so the report can state -- per tool -- how many
+    # files it analysed, skipped, or never saw because it did not run.
+    per_scanner = _per_scanner_coverage(declared, files)
+
+    # Deduplicated: one binary can back several categories (Checkov backs three),
+    # and listing it three times reads as three separate problems.
+    unavailable = sorted({r["tool"] for r in per_scanner if r["status"] == SCANNER_UNAVAILABLE})
+    failed = sorted({r["tool"] for r in per_scanner if r["status"] == SCANNER_FAILED_TO_COMPLETE})
+    if unavailable:
+        notes.append(
+            "Scanner(s) NOT AVAILABLE on this runner: %s. Files those scanners would have read "
+            "were not analysed by them, and their categories are NOT_VERIFIED."
+            % ", ".join(sorted(unavailable))
+        )
+    if failed:
+        notes.append(
+            "Scanner(s) that did NOT complete: %s. Their categories are NOT_VERIFIED and no file "
+            "is credited to them." % ", ".join(failed)
+        )
+
     return {
         "available": True,
         "workspace_files": len(files),
@@ -320,6 +449,9 @@ def _build_manifest(
         "complete": unanalysed_code == 0 and code_total > 0,
         "counts": counts,
         "secret_scanned_by": secret_scanned,
+        "per_scanner": per_scanner,
+        "scanners_unavailable": sorted(unavailable),
+        "scanners_failed": sorted(failed),
         "scanners": [c.to_dict() for c in declared],
         # Every uncovered file is counted; a bounded sample is named so the
         # report can show which ones without becoming unreadable.
@@ -328,6 +460,151 @@ def _build_manifest(
         "notes": notes,
         "statement": _statement(code_total, code_analysed, unanalysed_code, counts),
     }
+
+
+def _per_scanner_coverage(
+    coverages: Sequence[ScanCoverage], files: Sequence[str]
+) -> List[Dict[str, Any]]:
+    """What each individual scanner read, skipped, and could not read.
+
+    The aggregate census answers "was any file missed by everything?". This
+    answers "what did THIS scanner actually look at?" -- the question asked when
+    a finding is absent and someone needs to know whether it was looked for.
+
+    Every scanner is listed, including ones that read nothing, because the row
+    that says `0 analysed -- scanner_unavailable` is the most important row in
+    the table.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for coverage in coverages:
+        analysed = 0
+        excluded = 0
+        outside_capability = 0
+        would_have_read = 0
+
+        # A scanner that never declared a file-level reach has no knowable
+        # denominator. Reporting "0 of 149 analysed" for OWASP ZAP would invent
+        # a gap that does not exist -- ZAP does not read files at all -- and
+        # inventing gaps discredits the real ones.
+        if not coverage.declared:
+            row = {
+                "tool": coverage.tool,
+                "category": coverage.category_key,
+                "intent": "not_declared",
+                "status": coverage.status,
+                "status_reason": coverage.status_reason,
+                "completed": coverage.completed,
+                "unit": coverage.unit,
+                "analysed": 0,
+                "excluded": 0,
+                "outside_capability": 0,
+                "not_analysed": 0,
+                "in_scope": 0,
+                "file_level": False,
+                "excluded_patterns": [],
+                "vendored_skipped": [],
+                "reads_extensions": "not_declared",
+            }
+            row["statement"] = _scanner_statement(row)
+            rows.append(row)
+            continue
+
+        for relative in files:
+            extension = _extension(os.path.basename(relative))
+            if coverage.explicit_files is not None:
+                # The scanner named the files it read. Anything else is simply
+                # outside what it covered; we do not guess a reason on its behalf.
+                if relative in coverage.explicit_files:
+                    would_have_read += 1
+                    if coverage.completed:
+                        analysed += 1
+                else:
+                    outside_capability += 1
+                continue
+            if coverage.extensions and extension not in coverage.extensions:
+                # Not this engine's file type: not a gap on its part.
+                outside_capability += 1
+                continue
+            if is_excluded(relative, coverage.patterns):
+                excluded += 1
+                continue
+            would_have_read += 1
+            if coverage.completed:
+                analysed += 1
+
+        # The coverage this run lost because the scanner did not complete.
+        not_analysed = would_have_read - analysed
+
+        row: Dict[str, Any] = {
+            "tool": coverage.tool,
+            "category": coverage.category_key,
+            "file_level": True,
+            "intent": coverage.intent or "not_declared",
+            "status": coverage.status,
+            "status_reason": coverage.status_reason,
+            "completed": coverage.completed,
+            "unit": coverage.unit,
+            "analysed": analysed,
+            "excluded": excluded,
+            "outside_capability": outside_capability,
+            "not_analysed": not_analysed,
+            "in_scope": would_have_read,
+            "excluded_patterns": list(coverage.patterns),
+            "vendored_skipped": list(coverage.vendored_skipped),
+            "reads_extensions": list(coverage.extensions) or "all",
+        }
+        if coverage.unit_detail:
+            row["unit_detail"] = dict(coverage.unit_detail)
+        row["statement"] = _scanner_statement(row)
+        rows.append(row)
+
+    rows.sort(key=lambda r: (not r["file_level"], -r["analysed"], r["tool"], r["category"]))
+    return rows
+
+
+def _scanner_statement(row: Dict[str, Any]) -> str:
+    """One plain sentence per scanner, so the table needs no interpreting."""
+    tool = row["tool"]
+    label = "%s (%s)" % (tool, row["category"]) if row.get("category") else tool
+
+    if row["status"] == SCANNER_NOT_APPLICABLE:
+        return "%s did not apply to this project: %s" % (label, row["status_reason"])
+
+    # Without a declared reach there is no denominator, so the sentence says
+    # what is true -- nothing is credited -- and does not invent a file count.
+    if not row.get("file_level", True):
+        if row["status"] == SCANNER_UNAVAILABLE:
+            return (
+                "%s was NOT available on this runner and declared no file-level reach, so the "
+                "coverage it would have provided is NOT_ESTABLISHED." % label
+            )
+        if row["status"] == SCANNER_FAILED_TO_COMPLETE:
+            return (
+                "%s did NOT complete and declared no file-level reach, so the coverage it would "
+                "have provided is NOT_ESTABLISHED." % label
+            )
+        return (
+            "%s does not report file-level coverage. Its findings are reported; no file is "
+            "credited to it in the census above." % label
+        )
+
+    if row["status"] == SCANNER_UNAVAILABLE:
+        return (
+            "%s was NOT available on this runner. %d file(s) that it would have read were "
+            "therefore not analysed by it." % (label, row["not_analysed"])
+        )
+    if row["status"] == SCANNER_FAILED_TO_COMPLETE:
+        return (
+            "%s did NOT complete. %d file(s) within its scope were not analysed by it."
+            % (label, row["not_analysed"])
+        )
+    if row["unit"] != "files":
+        return "%s completed over %s." % (label, row["unit"])
+    return (
+        "%s analysed %d file(s); %d excluded by its own path policy; %d outside the file types "
+        "it parses." % (label, row["analysed"], row["excluded"], row["outside_capability"])
+    )
 
 
 def _named_sample(

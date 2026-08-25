@@ -1,2 +1,15 @@
-PyYAML>=6.0
-reportlab>=4.0.0
+# Runtime dependencies of the framework itself.
+#
+# Pinned to exact versions, deliberately. A security tool that resolves its own
+# dependencies to "whatever is newest today" cannot tell you which code produced
+# a verdict, and the evidence manifest would be recording a version it did not
+# control. Upgrades here are a reviewed change, not a side effect of a rebuild.
+#
+# The surface is kept deliberately small: everything else this framework needs is
+# in the Python standard library, so there are exactly two third-party packages
+# between a scan result and a report.
+#
+# To upgrade: bump the pin, run the full test suite, and record it in CHANGELOG.md.
+
+PyYAML==6.0.3
+reportlab==4.5.1

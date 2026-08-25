@@ -34,7 +34,7 @@ jobs:
   security:
     # Pin to a SHA in production. A tag is mutable; a SHA is not, and repinning
     # the previous SHA is the rollback path for a bad framework release.
-    uses: subashpixous/devsecops-framework/.github/workflows/security-pipeline.yml@v0.2.0
+    uses: subashpixous/devsecops-framework/.github/workflows/security-pipeline.yml@v0.5.0
     with:
       environment: production
       stages: PRE_BUILD

@@ -3,6 +3,172 @@
 All notable changes to this framework are recorded here. Releases are immutable
 tags; callers pin a tag or SHA, and rollback means repinning the previous one.
 
+## [0.5.0] - 2026-08-24
+
+Production-readiness release. Three defects meant consumers received less than
+this repository contained; four additions make each run prove what it checked.
+
+### Fixed - the shipped workflow ran the framework one phase behind itself
+
+`security-pipeline.yml` declared `active_phase: 6` while `default-policy.yml`
+declared 7. The CLI lets the workflow value override the policy, so for every
+consumer using the reusable workflow with defaults, `repo_hygiene` and
+`web_server_config` reported NOT_IMPLEMENTED and their collectors never ran.
+
+Those are the two categories v0.4.0 was released for. The behaviour was correct
+for a phase that has not shipped, and completely wrong for one that had.
+
+Reproduced on a sample project: phase 7 produced 3 findings, phase 6 produced 0.
+
+`tests/test_release_consistency.py` now asserts the workflow default equals the
+policy value, and that no implemented category sits above it. This defect class
+is invisible to Python tests because it lives in the seam between the code and
+the artefacts that ship it.
+
+### Fixed - the example every integrator copies was two releases stale
+
+`examples/caller-workflow.yml` pinned `@v0.2.0` while `docs/ONBOARDING.md`
+instructs integrators to copy that file verbatim. Anyone following the
+documentation got a framework with no SARIF, no CSV, no coverage census and no
+phase-7 categories. Now pinned to the current release, and asserted by test.
+
+### Fixed - documentation understated the control set
+
+README claimed 17 security categories; the registry declares 20. Asserted.
+
+### Added - SonarQube analysis identity and freshness
+
+SonarQube is the one scanner this framework does not execute: it reads results
+someone else produced, at some other time, over some other revision. Nothing
+verified that those results described the code under validation, which was the
+last remaining path to a PASS that did not describe the scanned commit.
+
+The collector now reads `/api/project_analyses/search` and compares the analysis
+revision against the commit being validated. Four states are reported verbatim:
+
+| State | Meaning | Can reach PASS |
+|---|---|---|
+| `SONARQUBE_SCAN_COMPLETED` | analysis covers this commit | yes |
+| `SONARQUBE_RESULT_STALE` | analysis describes different code | **no** |
+| `SONARQUBE_RESULT_UNAVAILABLE` | no usable analysis retrieved | **no** |
+| `SONARQUBE_PERMISSION_ERROR` | token rejected (401/403) | **no** |
+
+A revision match is authoritative at any age; a mismatch is stale at any age.
+Only where the server reports no revision does age decide, and the report says
+so -- an age-based assurance is not proof of revision identity, and the two are
+never presented as the same claim.
+
+Stale findings are still reported. They are real findings about real code, just
+not this commit's code, and deleting them would lose evidence.
+
+Also collected: quality gate, project measures (coverage, duplication, ncloc,
+issue counts) and the file list the analysis actually covered.
+
+### Added - per-scanner coverage transparency
+
+The census answered "did anything miss every scanner?". It could not answer
+"what did THIS scanner look at?" -- the question asked whenever a finding is
+absent and someone needs to know whether it was ever looked for.
+
+Every scanner now reports its own reach: files analysed, files excluded by its
+own path policy, files outside the types it parses, and files it would have read
+but did not. Each carries exactly one status: `analysed`, `scanner_unavailable`,
+`scanner_failed`, `not_applicable` or `coverage_not_declared`.
+
+Two rules keep it honest:
+
+  * A scanner with no declared file-level reach reports `n/a`, never `0`. OWASP
+    ZAP does not read files; "0 of 149 analysed" would invent a gap, and
+    inventing gaps discredits the real ones.
+  * Gitleaks now declares its reach BEFORE the availability guard, so a missing
+    gitleaks can state how much coverage was lost instead of leaving it
+    unquantified. The census still credits coverage only to scans that
+    completed, so declaring intent early cannot inflate anything.
+
+SonarQube declares the files its analysis covered, read from
+`/api/components/tree`. Previously the census counted Semgrep alone, so coverage
+read 0% whenever Semgrep failed even though a full SonarQube analysis had
+succeeded.
+
+### Added - exploitability enrichment (EPSS + CISA KEV)
+
+Severity answers "how bad if exploited". It does not answer "is anyone
+exploiting it", and 400 findings sorted by severity is a list nobody triages.
+
+`framework/core/prioritization.py` attaches EPSS exploit probabilities and CISA
+KEV known-exploited status. Three constraints:
+
+  * **Never fabricated.** A CVE with no score gets no score -- not 0.0, which
+    would sort it as harmless. `findings.csv` renders `NOT_ESTABLISHED` when the
+    source was unreachable and `NO_SCORE` when it was reachable but held no
+    entry for that CVE.
+  * **Never mandatory.** Both are third-party network calls. Failure degrades
+    the report, never the run: `EPSS_UNAVAILABLE` / `KEV_UNAVAILABLE` are
+    reported and findings pass through untouched. `--no-enrichment` disables
+    both; `--epss-file` / `--kev-file` support air-gapped runners.
+  * **Never a verdict input.** Enrichment orders findings; it does not decide
+    them. A verdict that depends on a third-party API is a verdict that changes
+    during that API's outage.
+
+### Added - cross-scanner corroboration
+
+When SonarQube and Semgrep both find the SQL injection on line 42, the report
+now says `Detected by: sonarqube + semgrep`.
+
+Correlation is **additive**: nothing is merged, renamed or dropped. Two engines
+agreeing is stronger evidence than one, and deleting a row deletes that. It also
+avoids reintroducing the fingerprint-collision failure this framework already
+fixed once -- merged findings share an identity, and one exception entry would
+then silently suppress a second scanner's evidence that nobody reviewed.
+
+Linking is deliberately conservative: same file AND a shared CWE AND within
+three lines. Findings without a CWE never correlate, because "two findings in
+the same file" is not evidence they are the same defect, and a wrong link is
+worse than no link. One scanner reporting twice is repetition, not confirmation.
+
+### Added - run evidence manifest
+
+`evidence-manifest.json` records what would let someone else reproduce the
+verdict: repository, commit, branch, framework and scanner versions, policy
+identity and thresholds, per-scanner exit codes and durations, the SonarQube
+analysis identity, the coverage census, the verdict, the limitations carried
+verbatim, and a SHA-256 of every artefact produced.
+
+It states its own limits: the digests establish that the artefacts have not
+changed since the run that wrote them. They are **not** signatures and do not
+establish authenticity -- anyone who can modify the artefacts can recompute the
+digests. A manifest that looks cryptographic without being so is worse than one
+that says plainly what it is.
+
+### Added - supply-chain hardening of the framework itself
+
+  * Scanner downloads are checksum-verified against the checksums file published
+    with the same release. This catches the realistic failure mode: a truncated
+    or corrupted download installing a broken scanner that reports nothing. It
+    does **not** defend against a compromised upstream release, and the workflow
+    comment says so rather than implying otherwise.
+  * cosign is pinned to a version instead of `releases/latest`. A floating
+    download makes the evidence manifest record a version nobody chose, and
+    cosign is the tool that verifies everyone else's signatures.
+  * `requirements.txt` is pinned exactly (`==`). A security tool that resolves
+    its own dependencies to "whatever is newest today" cannot say which code
+    produced a verdict.
+  * Tests assert all three, plus that every third-party action stays pinned to a
+    full commit SHA and that the pipeline grants no write scope beyond
+    `security-events`.
+
+### Tests
+
+255 -> 343. New suites: `test_sonarqube.py` (31 -- the collector had none),
+`test_prioritization.py` (26), `test_correlation.py` (21), `test_evidence.py`
+(18), `test_release_consistency.py` (15).
+
+One existing assertion changed. `test_a_result_without_a_declaration_contributes_nothing`
+asserted that an undeclared scanner was absent from the census list; it now
+asserts the scanner is listed but credited with nothing. The test name always
+described the real invariant -- contributes nothing -- and a scanner that
+vanishes from the census is exactly the silent gap the census exists to prevent.
+
 ## [0.4.0] - 2026-08-24
 
 File-level coverage, two categories for what code scanners cannot see, and

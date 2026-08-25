@@ -15,7 +15,22 @@ Endpoints used:
   GET /api/qualitygates/project_status
   GET /api/issues/search
   GET /api/hotspots/search
-  GET /api/rules/show            (metadata enrichment only)
+  GET /api/project_analyses/search   (analysis identity: date + revision)
+  GET /api/measures/component        (coverage, duplication, size, counts)
+  GET /api/rules/show                (metadata enrichment only)
+
+ANALYSIS IDENTITY
+-----------------
+SonarQube is the one scanner this framework does not execute: it reads results
+someone else's analysis produced. That makes "which code do these results
+describe?" a question no other collector has to ask, and answering it wrong is
+the only remaining way this framework can report a PASS that does not describe
+the commit under test.
+
+So the collector establishes the identity of the analysis it read -- its date and
+its revision -- and compares that revision against the commit being validated.
+A mismatch, or an analysis older than the permitted age, is STALE: reported,
+never silently accepted, and never PASS.
 """
 
 from __future__ import annotations
@@ -28,6 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..core.categories import SCANNER_OK
@@ -47,6 +63,36 @@ MAX_RULE_LOOKUPS = 150
 ISSUE_TYPES = "VULNERABILITY,BUG,CODE_SMELL"
 ISSUE_STATUSES = "OPEN,CONFIRMED,REOPENED"
 
+# --- Analysis state ----------------------------------------------------------
+# Four outcomes, reported verbatim in every report. Only the first one permits
+# the category to be asserted PASS.
+SONARQUBE_SCAN_COMPLETED = "SONARQUBE_SCAN_COMPLETED"
+SONARQUBE_RESULT_STALE = "SONARQUBE_RESULT_STALE"
+SONARQUBE_RESULT_UNAVAILABLE = "SONARQUBE_RESULT_UNAVAILABLE"
+SONARQUBE_PERMISSION_ERROR = "SONARQUBE_PERMISSION_ERROR"
+
+ANALYSIS_STATES = (
+    SONARQUBE_SCAN_COMPLETED,
+    SONARQUBE_RESULT_STALE,
+    SONARQUBE_RESULT_UNAVAILABLE,
+    SONARQUBE_PERMISSION_ERROR,
+)
+
+# How old an analysis may be before it stops describing "now". Only consulted
+# when the revision cannot be compared -- a revision match is authoritative at
+# any age, and a revision mismatch is stale at any age.
+DEFAULT_MAX_ANALYSIS_AGE_DAYS = 7
+
+# Measures worth reporting. Absent metrics are reported as NOT_ESTABLISHED
+# rather than zero: a project with no coverage measurement is not a project
+# with 0% coverage, and the two must never render identically.
+MEASURE_METRICS = (
+    "coverage", "line_coverage", "branch_coverage",
+    "duplicated_lines_density", "ncloc", "files",
+    "vulnerabilities", "bugs", "code_smells", "security_hotspots",
+    "reliability_rating", "security_rating", "sqale_rating",
+)
+
 _PROPERTY_FILES = ("sonar-project.properties", ".sonarcloud.properties", ".sonarqube.properties")
 
 
@@ -62,6 +108,88 @@ def redact_host(url: str) -> str:
         return urllib.parse.urlunsplit((parts.scheme, netloc, "", "", ""))
     except ValueError:
         return "<unparsable-host>"
+
+
+def parse_sonar_datetime(value: str) -> Optional[datetime]:
+    """Parse a SonarQube timestamp (``2026-08-24T09:12:33+0000``).
+
+    SonarQube emits an RFC-822 style offset with no colon, which
+    ``datetime.fromisoformat`` rejects before Python 3.11. Normalised here so the
+    freshness check behaves identically on every supported interpreter.
+    Returns None for anything unparsable -- an unreadable date is treated as
+    "not established", never as "recent".
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    normalised = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)
+    for candidate in (normalised, normalised.replace("Z", "+00:00")):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def evaluate_freshness(
+    analysis_date: Optional[datetime],
+    analysis_revision: str,
+    scanned_commit: str,
+    max_age_days: int = DEFAULT_MAX_ANALYSIS_AGE_DAYS,
+    now: Optional[datetime] = None,
+) -> Tuple[bool, str, str]:
+    """Decide whether an analysis describes the code being validated.
+
+    Returns (fresh, basis, explanation). `basis` names WHICH check decided it,
+    because "fresh by revision" and "fresh by age" are very different assurances
+    and the report must not present them as the same claim.
+
+    Revision comparison is authoritative when both revisions are known: an
+    analysis of the exact commit under test is current at any age, and an
+    analysis of a different commit is stale no matter how recent.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    if analysis_revision and scanned_commit:
+        # Servers and CI abbreviate SHAs inconsistently; compare on the shorter.
+        width = min(len(analysis_revision), len(scanned_commit))
+        if width >= 7 and analysis_revision[:width].lower() == scanned_commit[:width].lower():
+            return True, "revision", (
+                "The analysis read from the server was produced from revision %s, which is the "
+                "commit under validation." % analysis_revision[:12]
+            )
+        return False, "revision", (
+            "The analysis read from the server was produced from revision %s, but the commit "
+            "under validation is %s. These results describe different code."
+            % (analysis_revision[:12] or "NOT_ESTABLISHED", scanned_commit[:12])
+        )
+
+    if analysis_date is None:
+        return False, "unknown", (
+            "The server did not report when this project was last analysed, so it cannot be "
+            "shown that these results describe the current code."
+        )
+
+    age = now - analysis_date
+    if age > timedelta(days=max_age_days):
+        return False, "age", (
+            "The most recent analysis on the server is %d day(s) old (%s) and no revision was "
+            "reported, so it cannot be shown to describe the current code. The permitted age is "
+            "%d day(s)." % (age.days, analysis_date.strftime("%Y-%m-%dT%H:%M:%SZ"), max_age_days)
+        )
+    if age < timedelta(0):
+        return False, "age", (
+            "The most recent analysis is dated in the future (%s); the server clock or the "
+            "reported date cannot be trusted."
+            % analysis_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+    return True, "age", (
+        "The most recent analysis is %d day(s) old (%s), within the permitted %d day(s). No "
+        "revision was reported, so this is an age-based assurance only -- it does not prove the "
+        "analysis covered the exact commit under validation."
+        % (age.days, analysis_date.strftime("%Y-%m-%dT%H:%M:%SZ"), max_age_days)
+    )
 
 
 def resolve_project_key(workspace: str, explicit: Optional[str] = None) -> Tuple[str, str]:
@@ -156,6 +284,8 @@ class SonarQubeCollector(Collector):
         timeout: int = DEFAULT_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         enrich_rules: bool = True,
+        commit: str = "",
+        max_analysis_age_days: int = DEFAULT_MAX_ANALYSIS_AGE_DAYS,
     ) -> None:
         self.host_url = (host_url if host_url is not None else os.environ.get("SONAR_HOST_URL", "")).strip().rstrip("/")
         self._token = token if token is not None else os.environ.get("SONAR_TOKEN", "")
@@ -165,7 +295,14 @@ class SonarQubeCollector(Collector):
         self.timeout = timeout
         self.retries = max(1, retries)
         self.enrich_rules = enrich_rules
+        # The commit under validation. Empty means the freshness check falls back
+        # to analysis age, which is a weaker assurance and says so in the report.
+        self.commit = (commit or "").strip()
+        self.max_analysis_age_days = max(1, int(max_analysis_age_days or DEFAULT_MAX_ANALYSIS_AGE_DAYS))
         self.branch_supported = True
+        # Set the moment any endpoint returns 401/403, so an authorisation
+        # problem is reported as exactly that rather than as a generic failure.
+        self.permission_denied = False
 
     # -- HTTP -----------------------------------------------------------------
 
@@ -205,6 +342,12 @@ class SonarQubeCollector(Collector):
                 except Exception:  # pragma: no cover - best effort only
                     detail = ""
                 last_error = "HTTP %s from %s%s" % (exc.code, path, (": " + detail) if detail else "")
+                # An authorisation failure is a distinct, actionable condition:
+                # the token is wrong, expired, or lacks "Browse" on this project.
+                # Recorded so the report names the cause instead of reporting a
+                # generic scan failure the reader cannot act on.
+                if exc.code in (401, 403):
+                    self.permission_denied = True
                 # Client errors are deterministic; retrying cannot help.
                 if 400 <= exc.code < 500:
                     return None, last_error, last_status
@@ -229,6 +372,7 @@ class SonarQubeCollector(Collector):
         """
         if self.branch and self.branch_supported:
             payload, error, status = self._get(path, dict(params, branch=self.branch))
+            self._note_status(status)
             if payload is not None:
                 return payload, None
             if status in (400, 404):
@@ -240,8 +384,20 @@ class SonarQubeCollector(Collector):
             else:
                 return None, error
 
-        payload, error, _ = self._get(path, params)
+        payload, error, status = self._get(path, params)
+        self._note_status(status)
         return payload, error
+
+    def _note_status(self, status: int) -> None:
+        """Record an authorisation failure seen on any endpoint.
+
+        Detection lives here rather than only in the transport's exception
+        handler so it depends on the status code the server returned, not on how
+        that status happened to reach us. A 403 is a 403 whether it arrived as an
+        HTTPError, a wrapped response, or a stubbed one under test.
+        """
+        if status in (401, 403):
+            self.permission_denied = True
 
     # -- Paging ---------------------------------------------------------------
 
@@ -280,6 +436,134 @@ class SonarQubeCollector(Collector):
                 break
 
         return items, None, truncated
+
+    # -- Analysis identity ----------------------------------------------------
+
+    def _fetch_last_analysis(
+        self, project_key: str, result: ScannerResult
+    ) -> Dict[str, Any]:
+        """Identity of the most recent analysis: when it ran and over what code.
+
+        Never fatal on its own. When it cannot be established the freshness check
+        degrades to "unknown", which is a non-PASS state -- an unestablished
+        analysis identity must not read as a current one.
+        """
+        identity: Dict[str, Any] = {
+            "available": False,
+            "date": "",
+            "revision": "",
+            "analysis_key": "",
+            "project_version": "",
+            "error": "",
+        }
+        payload, error = self._get_with_branch_fallback(
+            "/api/project_analyses/search", {"project": project_key, "ps": 1}, result
+        )
+        if payload is None:
+            identity["error"] = error or "no response"
+            result.warnings.append(
+                "The date and revision of the last SonarQube analysis could not be retrieved (%s). "
+                "Result freshness is therefore NOT_ESTABLISHED." % identity["error"]
+            )
+            return identity
+
+        analyses = payload.get("analyses") or []
+        if not analyses:
+            identity["error"] = "the server reports no analysis for this project"
+            result.warnings.append(
+                "SonarQube holds no analysis for project %r. There are no results to read, so "
+                "nothing about this project's static analysis can be asserted." % project_key
+            )
+            return identity
+
+        latest = analyses[0] or {}
+        identity.update(
+            {
+                "available": True,
+                "date": str(latest.get("date") or ""),
+                "revision": str(latest.get("revision") or ""),
+                "analysis_key": str(latest.get("key") or ""),
+                "project_version": str(latest.get("projectVersion") or ""),
+            }
+        )
+        return identity
+
+    def _fetch_measures(self, project_key: str, result: ScannerResult) -> Dict[str, Any]:
+        """Project measures: coverage, duplication, size and issue counts.
+
+        Best-effort context for the report. A metric the server does not hold is
+        omitted, and the report renders anything absent as NOT_ESTABLISHED --
+        never as zero.
+        """
+        payload, error = self._get_with_branch_fallback(
+            "/api/measures/component",
+            {"component": project_key, "metricKeys": ",".join(MEASURE_METRICS)},
+            result,
+        )
+        if payload is None:
+            result.warnings.append(
+                "SonarQube project measures (coverage, duplication, size) could not be retrieved "
+                "(%s); they are reported as NOT_ESTABLISHED." % (error or "no response")
+            )
+            return {}
+
+        component = payload.get("component") or {}
+        measures: Dict[str, Any] = {}
+        for measure in component.get("measures") or []:
+            metric = measure.get("metric")
+            if not metric:
+                continue
+            measures[metric] = measure.get("value", measure.get("period", {}).get("value", ""))
+        return measures
+
+    def _fetch_analysed_files(self, project_key: str, result: ScannerResult) -> List[str]:
+        """The files SonarQube actually holds for this project.
+
+        Without this the framework knows SonarQube ran but not what it read, and
+        the file-level census cannot credit it with a single file -- which made
+        coverage read 0% whenever Semgrep failed even though a full analysis had
+        succeeded. Crediting only the files that carry findings would be worse:
+        it would report a clean file as unanalysed.
+
+        `/api/components/tree` with `qualifiers=FIL` is the reporting endpoint
+        that answers the question directly. Failure is non-fatal and degrades to
+        "reach not declared", never to an assumed reach.
+        """
+        paths: List[str] = []
+        page = 1
+        while True:
+            payload, error = self._get_with_branch_fallback(
+                "/api/components/tree",
+                {"component": project_key, "qualifiers": "FIL", "p": page, "ps": PAGE_SIZE},
+                result,
+            )
+            if payload is None:
+                result.warnings.append(
+                    "The list of files covered by the SonarQube analysis could not be retrieved "
+                    "(%s). SonarQube's file-level reach is NOT_ESTABLISHED for this run, so no "
+                    "file is credited to it in the coverage census." % (error or "no response")
+                )
+                return []
+
+            components = payload.get("components") or []
+            for component in components:
+                path = str(component.get("path") or "").strip()
+                if path:
+                    paths.append(path.replace("\\", "/"))
+
+            paging = payload.get("paging") or {}
+            total = int(paging.get("total") or len(paths))
+            if len(paths) >= total or not components:
+                break
+            page += 1
+            if page * PAGE_SIZE > MAX_PAGEABLE:
+                result.warnings.append(
+                    "The SonarQube component list was truncated at the server's %d-result paging "
+                    "limit; its declared file coverage is a lower bound." % MAX_PAGEABLE
+                )
+                break
+
+        return paths
 
     # -- Enrichment -----------------------------------------------------------
 
@@ -325,6 +609,8 @@ class SonarQubeCollector(Collector):
         result.metadata["read_only"] = True
         result.metadata["host"] = redact_host(self.host_url)
 
+        result.metadata["analysis_state"] = SONARQUBE_RESULT_UNAVAILABLE
+
         if not self.host_url:
             return result.fail(
                 "SONAR_HOST_URL is not set. SonarQube results could not be collected."
@@ -364,7 +650,40 @@ class SonarQubeCollector(Collector):
         else:
             payload["server_version"] = version_payload
 
-        # 2. Quality gate -- an authoritative, explicit security signal.
+        # 2. Analysis identity -- WHICH code do the results below describe?
+        identity = self._fetch_last_analysis(project_key, result)
+        payload["analysis"] = identity
+        analysis_date = parse_sonar_datetime(identity.get("date", ""))
+        fresh, basis, freshness_reason = evaluate_freshness(
+            analysis_date,
+            identity.get("revision", ""),
+            self.commit,
+            self.max_analysis_age_days,
+        )
+        payload["freshness"] = {
+            "fresh": fresh,
+            "basis": basis,
+            "reason": freshness_reason,
+            "scanned_commit": self.commit or "NOT_ESTABLISHED",
+            "analysis_revision": identity.get("revision") or "NOT_ESTABLISHED",
+            "analysis_date": identity.get("date") or "NOT_ESTABLISHED",
+            "max_age_days": self.max_analysis_age_days,
+        }
+        result.metadata["analysis_date"] = identity.get("date") or "NOT_ESTABLISHED"
+        result.metadata["analysis_revision"] = identity.get("revision") or "NOT_ESTABLISHED"
+        result.metadata["scanned_commit"] = self.commit or "NOT_ESTABLISHED"
+        result.metadata["freshness_basis"] = basis
+        if not fresh:
+            # A stale result is not a failed scan -- the data is real, it simply
+            # does not describe this commit. PARTIAL keeps the findings in the
+            # report (they are still true of the code they were produced from)
+            # while denying the category a PASS it has not earned.
+            result.partial(
+                "SONARQUBE_RESULT_STALE: %s These findings are reported for information; they "
+                "are NOT evidence about the code in this run." % freshness_reason
+            )
+
+        # 3. Quality gate -- an authoritative, explicit security signal.
         gate, gate_error = self._get_with_branch_fallback(
             "/api/qualitygates/project_status", {"projectKey": project_key}, result
         )
@@ -374,7 +693,29 @@ class SonarQubeCollector(Collector):
         else:
             payload["quality_gate"] = gate
 
-        # 3. Issues.
+        # 4. Project measures -- coverage, duplication, size, counts.
+        payload["measures"] = self._fetch_measures(project_key, result)
+
+        # 4b. Which files this analysis actually covered. Declared to the
+        # file-level census so SonarQube is credited for the code it read, and
+        # only for that code.
+        analysed_files = self._fetch_analysed_files(project_key, result)
+        payload["analysed_files_count"] = len(analysed_files)
+        if analysed_files:
+            result.metadata["coverage"] = {
+                "exclusions": {"intent": "sast", "patterns": []},
+                "extensions": [],
+                "files": analysed_files,
+                "unit": "files",
+                "unit_detail": {
+                    "source": "SonarQube /api/components/tree",
+                    "analysis_revision": identity.get("revision") or "NOT_ESTABLISHED",
+                    "analysis_date": identity.get("date") or "NOT_ESTABLISHED",
+                },
+            }
+            result.metadata["analysed_file_count"] = len(analysed_files)
+
+        # 5. Issues.
         issues, issues_error, issues_truncated = self._paginate(
             "/api/issues/search",
             {
@@ -395,7 +736,7 @@ class SonarQubeCollector(Collector):
                 % MAX_PAGEABLE
             )
 
-        # 4. Security hotspots (separate endpoint on modern SonarQube).
+        # 6. Security hotspots (separate endpoint on modern SonarQube).
         hotspots, hotspots_error, hotspots_truncated = self._paginate(
             "/api/hotspots/search", {"projectKey": project_key}, "hotspots", result
         )
@@ -408,7 +749,7 @@ class SonarQubeCollector(Collector):
         if hotspots_truncated:
             result.partial("Hotspot set truncated at the SonarQube paging limit; the hotspot list is incomplete.")
 
-        # 5. Rule metadata for CWE/OWASP mapping.
+        # 7. Rule metadata for CWE/OWASP mapping.
         security_rules = sorted(
             {
                 issue.get("rule", "")
@@ -422,6 +763,28 @@ class SonarQubeCollector(Collector):
         result.metadata["branch_scope"] = payload["branch_scope"]
         result.metadata["issue_count"] = len(issues)
         result.metadata["hotspot_count"] = len(hotspots)
+
+        # --- Resolve the analysis state ------------------------------------
+        # Exactly one of four, decided in strict precedence. Only
+        # SONARQUBE_SCAN_COMPLETED leaves the result trustworthy, and therefore
+        # only it permits the category to reach PASS.
+        if self.permission_denied:
+            state = SONARQUBE_PERMISSION_ERROR
+            result.fail(
+                "SONARQUBE_PERMISSION_ERROR: the supplied token was rejected (HTTP 401/403) by at "
+                "least one endpoint. The token is invalid, expired, or lacks 'Browse' permission "
+                "on project %r. No assertion about static analysis can be made." % project_key
+            )
+        elif result.errors:
+            state = SONARQUBE_RESULT_UNAVAILABLE
+        elif not fresh:
+            state = SONARQUBE_RESULT_STALE
+        else:
+            state = SONARQUBE_SCAN_COMPLETED
+
+        payload["analysis_state"] = state
+        payload["analysis_state_reason"] = freshness_reason
+        result.metadata["analysis_state"] = state
         result.payload = payload
 
         result.succeed()
@@ -442,6 +805,7 @@ class SonarQubeCollector(Collector):
 
 _COLLECTOR_KWARGS = {
     "host_url", "token", "project_key", "branch", "workspace", "timeout", "retries", "enrich_rules",
+    "commit", "max_analysis_age_days",
 }
 
 
@@ -466,4 +830,10 @@ register_scanner(
     )
 )
 
-__all__ = ["SonarQubeCollector", "resolve_project_key", "redact_host", "TOOL", "CATEGORY_KEY", "SCANNER_OK"]
+__all__ = [
+    "SonarQubeCollector", "resolve_project_key", "redact_host", "TOOL", "CATEGORY_KEY", "SCANNER_OK",
+    "parse_sonar_datetime", "evaluate_freshness", "ANALYSIS_STATES",
+    "SONARQUBE_SCAN_COMPLETED", "SONARQUBE_RESULT_STALE",
+    "SONARQUBE_RESULT_UNAVAILABLE", "SONARQUBE_PERMISSION_ERROR",
+    "DEFAULT_MAX_ANALYSIS_AGE_DAYS", "MEASURE_METRICS",
+]

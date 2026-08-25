@@ -41,6 +41,8 @@ def build_report(
     findings: List[Finding],
     scanner_results: List[Any],
     file_coverage: Optional[Dict[str, Any]] = None,
+    enrichment: Optional[Dict[str, Any]] = None,
+    correlation: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble the complete report document."""
     ordered = sort_findings(findings)
@@ -102,6 +104,24 @@ def build_report(
                 "File-level coverage is UNKNOWN for this run. This is not a statement that "
                 "every file was analysed."
             ),
+        },
+        # Exploitability context. Reported as its own block with explicit
+        # availability states, because "no finding is KEV-listed" and "we could
+        # not reach the KEV feed" are opposite conclusions that must never
+        # render identically.
+        "enrichment": enrichment or {
+            "epss_status": "EPSS_DISABLED",
+            "kev_status": "KEV_DISABLED",
+            "statement": (
+                "Exploitability enrichment did not run for this report. No finding carries an "
+                "EPSS score or known-exploited status; this is absence of data, not evidence "
+                "that the findings are not exploited."
+            ),
+        },
+        # Corroboration across scanners. Retained as evidence, never merged.
+        "correlation": correlation or {
+            "groups": [], "corroborated_defects": 0, "findings_correlated": 0,
+            "statement": "Cross-scanner correlation did not run for this report.",
         },
         "categories": [c.to_dict() for c in assessment.categories],
         "category_summary": {

@@ -89,8 +89,13 @@ on:
         type: string
         default: ""
       active_phase:
+        description: >-
+          Roadmap phase to execute. Categories above this phase report
+          NOT_IMPLEMENTED and their collectors do not run, so this must never sit
+          below the phase declared in framework/policy/default-policy.yml.
+          Asserted by tests/test_release_consistency.py.
         type: number
-        default: 6
+        default: 7
       install_tools:
         description: "Install the external scanners. Disable to use a pre-baked runner image."
         type: boolean
@@ -233,6 +238,7 @@ jobs:
           TRIVY_VERSION: "0.74.0"
           GITLEAKS_VERSION: "8.23.1"
           NUCLEI_VERSION: "3.3.7"
+          COSIGN_VERSION: "2.4.1"
         run: |
           set -uo pipefail
           install_log=/tmp/tool-install.log
@@ -248,27 +254,77 @@ jobs:
             fi
           }
 
+          # Verify a download against the checksums file published with the same
+          # release, then record the digest we actually got.
+          #
+          # WHAT THIS PROTECTS AGAINST: a truncated, corrupted, or tampered-in-
+          # transit download -- the realistic failure modes for a CI runner
+          # pulling a binary over the public internet. A partial download that
+          # still exits 0 would otherwise install a broken scanner, and a broken
+          # scanner is the exact condition this framework exists to notice.
+          #
+          # WHAT IT DOES NOT PROTECT AGAINST: a compromised upstream release.
+          # The checksums come from the same origin as the artefact, so an
+          # attacker who can replace one can replace the other. Defending
+          # against that needs digests pinned in this file and reviewed on every
+          # bump; it is a deliberate future step, not something this check
+          # silently claims to do.
+          verify_sha256() {
+            local file="$1" expected="$2" name="$3"
+            local actual
+            actual="$(sha256sum "$file" | awk '{print $1}')"
+            echo "    $name sha256=$actual" >>"$install_log"
+            if [ -z "$expected" ]; then
+              echo "    WARNING: no published checksum found for $name; digest recorded only" \
+                | tee -a "$install_log"
+              return 0
+            fi
+            if [ "$actual" != "$expected" ]; then
+              echo "    CHECKSUM MISMATCH for $name (expected $expected, got $actual)" \
+                | tee -a "$install_log"
+              return 1
+            fi
+            echo "    checksum verified for $name" >>"$install_log"
+          }
+
           try semgrep python -m pip install --quiet semgrep
           try checkov python -m pip install --quiet checkov
 
+          # Look up one artefact's digest in a release checksums file.
+          published_sha() {
+            local url="$1" artefact="$2"
+            curl -sSfL "$url" 2>/dev/null | grep -F " $artefact" | head -1 | awk '{print $1}' || true
+          }
+
           try gitleaks bash -c '
-            curl -sSfL -o /tmp/gitleaks.tar.gz \
-              "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" &&
+            base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+            artefact="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            curl -sSfL -o /tmp/gitleaks.tar.gz "${base}/${artefact}" &&
+            verify_sha256 /tmp/gitleaks.tar.gz "$(published_sha "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" "$artefact")" gitleaks &&
             tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks'
 
           try trivy bash -c '
-            curl -sSfL -o /tmp/trivy.tar.gz               "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" &&
+            base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+            artefact="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+            curl -sSfL -o /tmp/trivy.tar.gz "${base}/${artefact}" &&
+            verify_sha256 /tmp/trivy.tar.gz "$(published_sha "${base}/trivy_${TRIVY_VERSION}_checksums.txt" "$artefact")" trivy &&
             tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy'
 
           try nuclei bash -c '
-            curl -sSfL -o /tmp/nuclei.zip \
-              "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" &&
+            base="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}"
+            artefact="nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
+            curl -sSfL -o /tmp/nuclei.zip "${base}/${artefact}" &&
+            verify_sha256 /tmp/nuclei.zip "$(published_sha "${base}/nuclei_${NUCLEI_VERSION}_checksums.txt" "$artefact")" nuclei &&
             unzip -oq /tmp/nuclei.zip -d /usr/local/bin nuclei'
 
+          # cosign is pinned to a version rather than "latest": a floating
+          # download makes the evidence manifest record a version nobody chose,
+          # and cosign is the tool that verifies everyone else's signatures.
           try cosign bash -c '
-            curl -sSfL -o /usr/local/bin/cosign \
-              "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64" &&
-            chmod +x /usr/local/bin/cosign'
+            base="https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}"
+            curl -sSfL -o /tmp/cosign "${base}/cosign-linux-amd64" &&
+            verify_sha256 /tmp/cosign "$(published_sha "${base}/cosign_checksums.txt" "cosign-linux-amd64")" cosign &&
+            install -m 0755 /tmp/cosign /usr/local/bin/cosign'
 
           echo "=== scanner availability ==="
           for t in semgrep gitleaks trivy checkov nuclei cosign docker; do

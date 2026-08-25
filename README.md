@@ -4,7 +4,7 @@ A reusable security validation layer for production repositories. It wraps an
 existing delivery pipeline instead of replacing it: it does not build, does not
 deploy, and does not modify the project it inspects.
 
-**Current release: v0.4.0 — file-level coverage, repository and web-server categories, and findings delivered to the pull request.**
+**Current release: v0.5.0 — per-scanner coverage transparency, SonarQube analysis identity, exploitability enrichment and a run evidence manifest.**
 
 ---
 
@@ -14,7 +14,12 @@ deploy, and does not modify the project it inspects.
 |---|---|
 | No false PASS | Every failure path resolves to `NOT_VERIFIED`. A missing tool, a failed scan, a partial result, a skipped input and a malformed payload are all non-PASS. Enforced by unit tests that must pass before a release tag is cut. |
 | No unread code | Every file lands in one coverage bucket with a reason: analysed, excluded (pattern named), no engine for its type, or its engine did not complete. A scanner that failed is credited with nothing. |
-| No silent gaps | All 17 security categories resolve to exactly one of `PASS` / `FAILED` / `NOT_VERIFIED` / `NOT_APPLICABLE` / `NOT_IMPLEMENTED` and appear in every report. |
+| Per-scanner proof | Every scanner reports its own reach — files analysed, excluded, outside its file types, and not analysed because it did not run. A scanner with no declared file reach reports `n/a`, never `0`, so no gap is invented. |
+| No stale analysis | SonarQube results are compared against the commit under validation. `SONARQUBE_RESULT_STALE`, `_UNAVAILABLE` and `_PERMISSION_ERROR` can never reach PASS. |
+| No fabricated risk data | A CVE with no EPSS score gets no score — never `0.0`, which would sort as harmless. Unreachable sources report `EPSS_UNAVAILABLE` / `KEV_UNAVAILABLE`, and never influence the verdict. |
+| Corroboration is kept | When two scanners find the same defect, both findings are retained and the report says `Detected by: sonarqube + semgrep`. Merging would lose evidence and let one exception suppress two sources. |
+| Reproducible runs | `evidence-manifest.json` records commit, versions, policy, per-scanner exit codes, coverage and a SHA-256 of every artefact. It states plainly that digests are not signatures. |
+| No silent gaps | All 20 security categories resolve to exactly one of `PASS` / `FAILED` / `NOT_VERIFIED` / `NOT_APPLICABLE` / `NOT_IMPLEMENTED` and appear in every report. |
 | Status independence | `BUILD`, `DEPLOYMENT`, `SECURITY` and `RUNTIME_SECURITY` are computed separately. A successful deployment can never raise a security status. |
 | No secrets in output | Gitleaks' `Secret`/`Match` fields are stripped at collection; bundle findings carry a length and a SHA-256 prefix, never the value; tool output is redacted; ZAP and Nuclei response echoes are dropped. |
 | Suppressions cannot rot | An exception with no expiry date, or a past one, is EXPIRED and does **not** suppress. |
@@ -128,15 +133,35 @@ exists so a broken framework is loud; it never becomes a passing verdict.
 ```
 security-results/
 ├── capabilities.json          what was detected, with evidence
-├── <tool>.json                raw payload per scanner (evidence)
+├── <tool>.json                raw payload per scanner (written when one exists)
 ├── sbom.cdx.json              CycloneDX SBOM, when generated
 ├── normalized-findings.json   common schema — also the next run's baseline
 ├── final-report.json          machine-readable source of truth
+├── evidence-manifest.json     provenance: commit, versions, policy, exit codes,
+│                              coverage, verdict, SHA-256 of every artefact
 ├── findings.csv               EVERY finding, never truncated, with an owner column
 ├── security.sarif             uploaded to code scanning — inline in the PR
 ├── report.md
 └── security-report.pdf
 ```
+
+## Exploitability enrichment
+
+Findings carrying a CVE are enriched with [EPSS](https://www.first.org/epss/)
+exploit probability and [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
+known-exploited status, so a list of CRITICALs becomes an ordering.
+
+Both are third-party network calls, so both degrade rather than fail:
+
+| Flag | Effect |
+|---|---|
+| *(default)* | Live lookup; failure reports `EPSS_UNAVAILABLE` / `KEV_UNAVAILABLE` |
+| `--no-enrichment` | Skip both entirely; reports `EPSS_DISABLED` / `KEV_DISABLED` |
+| `--epss-file` / `--kev-file` | Read from local JSON — air-gapped runners |
+
+Enrichment **never influences the security verdict.** It orders findings; the
+policy decides them. A verdict that depended on a third-party API would change
+during that API's outage.
 
 ## Coverage
 

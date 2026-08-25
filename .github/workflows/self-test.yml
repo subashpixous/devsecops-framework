@@ -176,18 +176,91 @@ jobs:
           set -euo pipefail
           # With no external tools present, every external category must be
           # unverified and the verdict must NOT be PASS.
+          # --no-enrichment keeps this test hermetic: a CI job must not fail
+          # because a third-party API was slow, and enrichment availability is
+          # covered by its own unit tests.
           python -m framework.cli run \
             --workspace . \
             --output /tmp/security-results \
-            --environment ci
+            --environment ci \
+            --no-enrichment
           test -f /tmp/security-results/final-report.json
           test -f /tmp/security-results/report.md
           test -f /tmp/security-results/security-report.pdf
+          test -f /tmp/security-results/findings.csv
+          test -f /tmp/security-results/security.sarif
+          test -f /tmp/security-results/evidence-manifest.json
           python - <<'PY'
           import json
           report = json.load(open("/tmp/security-results/final-report.json"))
           status = report["status"]["security"]
           assert status != "PASS", "no scanners installed but SECURITY reported PASS"
           assert report["status"]["coverage_complete"] is False
-          print("OK: JSON, Markdown and PDF produced; SECURITY=%s (correctly not PASS)." % status)
+          print("OK: all five formats produced; SECURITY=%s (correctly not PASS)." % status)
+          PY
+
+      - name: Verify the run proves what it checked
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          report = json.load(open("/tmp/security-results/final-report.json"))
+          manifest = json.load(open("/tmp/security-results/evidence-manifest.json"))
+
+          # 1. Every scanner must appear in the census with a reason, so none can
+          #    vanish silently.
+          coverage = report["file_coverage"]
+          assert coverage.get("per_scanner"), "the census reports no per-scanner coverage"
+          for row in coverage["per_scanner"]:
+              assert row["status"], "scanner %s has no coverage status" % row["tool"]
+              assert row["statement"], "scanner %s has no plain-language statement" % row["tool"]
+              # A scanner with no declared file reach must not report a fabricated
+              # denominator.
+              if not row["file_level"]:
+                  assert row["not_analysed"] == 0, (
+                      "%s declared no file reach but claims %d files missed"
+                      % (row["tool"], row["not_analysed"])
+                  )
+
+          # 2. Enrichment must never silently look like "nothing is exploited".
+          enrichment = report["enrichment"]
+          assert enrichment["epss_status"].startswith("EPSS_")
+          assert enrichment["kev_status"].startswith("KEV_")
+          assert enrichment.get("statement")
+
+          # 3. The evidence manifest must be reproducible and self-limiting.
+          assert manifest["available"], manifest.get("reason")
+          assert manifest["artefacts"], "no artefact digests recorded"
+          assert "NOT signatures" in manifest["integrity_note"], (
+              "the manifest must not imply its digests establish authenticity"
+          )
+          assert manifest["execution"]["scanners_registered"] > 0
+
+          print("OK: %d scanners accounted for, %d artefacts hashed, enrichment state %s/%s."
+                % (len(coverage["per_scanner"]), len(manifest["artefacts"]),
+                   enrichment["epss_status"], enrichment["kev_status"]))
+          PY
+
+      - name: Verify a stale SonarQube analysis can never reach PASS
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from framework.collectors.sonarqube import (
+              SONARQUBE_RESULT_STALE, SONARQUBE_SCAN_COMPLETED, evaluate_freshness,
+          )
+          from datetime import datetime, timedelta, timezone
+
+          now = datetime.now(timezone.utc)
+          commit = "a" * 40
+
+          fresh, basis, _ = evaluate_freshness(now, commit, commit, now=now)
+          assert fresh and basis == "revision", "a matching revision must be fresh"
+
+          stale, basis, _ = evaluate_freshness(now, "b" * 40, commit, now=now)
+          assert not stale, "a mismatched revision must be stale however recent"
+
+          old, _, _ = evaluate_freshness(now - timedelta(days=400), "", "", now=now)
+          assert not old, "an aged-out analysis must be stale"
+
+          print("OK: stale SonarQube results cannot be presented as current.")
           PY

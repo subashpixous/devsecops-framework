@@ -210,7 +210,29 @@ class FailClosedTestCase(unittest.TestCase):
         result = ScannerResult(tool="mystery", category_key="c")
         result.payload = {}
         result.succeed()
-        self.assertEqual(scan_coverage_from_results([result]), [])
+        coverages = scan_coverage_from_results([result])
+
+        # It is listed -- a scanner that disappears from the census is the exact
+        # silent gap this module exists to prevent -- but it is credited with
+        # nothing, which is the invariant that matters.
+        self.assertEqual(len(coverages), 1)
+        entry = coverages[0]
+        self.assertEqual(entry.tool, "mystery")
+        self.assertFalse(entry.completed)
+        self.assertEqual(entry.status, "coverage_not_declared")
+        self.assertFalse(entry.reads("app.py", ".py"))
+
+    def test_an_undeclared_scanner_credits_no_file_in_the_manifest(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            with open(os.path.join(workspace, "app.py"), "w", encoding="utf-8") as handle:
+                handle.write("x = 1\n")
+            result = ScannerResult(tool="mystery", category_key="c")
+            result.payload = {}
+            result.succeed()
+            manifest = build_manifest(workspace, [result], ["python"])
+
+        self.assertEqual(manifest["code_files_analysed"], 0)
+        self.assertFalse(manifest["complete"])
 
 
 if __name__ == "__main__":

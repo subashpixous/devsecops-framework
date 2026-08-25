@@ -52,6 +52,20 @@ EXTENSION_SCHEMA_KEYS = [
     "exception_reason",
     "exception_expires",
     "exception_owner",
+    # Exploitability context (framework.core.prioritization). Absent when the
+    # data source was unavailable -- never defaulted to a number, because a
+    # score of 0.0 sorts as harmless and "unknown" must not.
+    "cve_ids",
+    "epss_score",
+    "epss_percentile",
+    "epss_band",
+    "kev_listed",
+    "kev_date_added",
+    "kev_due_date",
+    # Cross-scanner corroboration (framework.core.correlation). Additive only:
+    # correlated findings are never merged or removed.
+    "correlation_id",
+    "also_detected_by",
 ]
 
 # --- Canonical severity ------------------------------------------------------
@@ -224,6 +238,24 @@ class Finding:
     exception_reason: str = ""
     exception_expires: str = ""
     exception_owner: str = ""
+
+    # Exploitability context (set by framework.core.prioritization).
+    # None means "not established", which is deliberately distinct from a low
+    # score: one says nobody looked, the other says somebody looked and it is
+    # unlikely. Rendering them identically would be a silent gap.
+    cve_ids: List[str] = field(default_factory=list)
+    epss_score: Optional[float] = None
+    epss_percentile: Optional[float] = None
+    epss_band: str = ""
+    kev_listed: bool = False
+    kev_date_added: str = ""
+    kev_due_date: str = ""
+
+    # Cross-scanner corroboration. `also_detected_by` names the OTHER tools that
+    # independently reported the same defect; this finding still stands on its
+    # own with its own fingerprint and lifecycle.
+    correlation_id: str = ""
+    also_detected_by: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.severity = normalise_severity(self.severity or self.raw_severity)
