@@ -66,19 +66,41 @@ rules:
       remediation: >-
         Use prepared statements with bound parameters (PDO::prepare + execute, or
         mysqli_prepare + bind_param).
-    patterns:
-      - pattern-either:
-          - pattern: mysqli_query($CONN, $QUERY)
-          - pattern: mysqli_query($CONN, $QUERY, ...)
-          - pattern: mysql_query($QUERY)
-          - pattern: mysql_query($QUERY, ...)
-          - pattern: $CONN->query($QUERY)
-          - pattern: $CONN->query($QUERY, ...)
-          - pattern: $PDO->exec($QUERY)
-          - pattern: $CONN->real_query($QUERY)
-      - metavariable-regex:
-          metavariable: $QUERY
-          regex: \$_(GET|POST|REQUEST|COOKIE|FILES)\b
+    # TWO GROUPS, because the shapes need different machinery. CI reported
+    # `missed lines: [19, 27]` -- the interpolated and concatenated cases -- while
+    # the direct-argument case passed. metavariable-regex sees the source text of
+    # a DIRECT binding, but not a superglobal buried inside an interpolated
+    # string or a concatenation. The second group uses Semgrep's deep expression
+    # operator `<... ... >`, which matches a sub-expression anywhere inside the
+    # call, and constrains the VARIABLE rather than the whole argument.
+    pattern-either:
+      # 1. Superglobal passed directly as the query argument.
+      - patterns:
+          - pattern-either:
+              - pattern: mysqli_query($CONN, $QUERY)
+              - pattern: mysqli_query($CONN, $QUERY, ...)
+              - pattern: mysql_query($QUERY)
+              - pattern: mysql_query($QUERY, ...)
+              - pattern: $CONN->query($QUERY)
+              - pattern: $CONN->query($QUERY, ...)
+              - pattern: $PDO->exec($QUERY)
+              - pattern: $CONN->real_query($QUERY)
+          - metavariable-regex:
+              metavariable: $QUERY
+              regex: \$_(GET|POST|REQUEST|COOKIE|FILES)\b
+      # 2. Superglobal interpolated into, or concatenated onto, the query.
+      - patterns:
+          - pattern-either:
+              - pattern: mysqli_query($CONN, <... $REQ[...] ...>)
+              - pattern: mysqli_query($CONN, <... $REQ[...] ...>, ...)
+              - pattern: mysql_query(<... $REQ[...] ...>)
+              - pattern: $CONN->query(<... $REQ[...] ...>)
+              - pattern: $CONN->query(<... $REQ[...] ...>, ...)
+              - pattern: $PDO->exec(<... $REQ[...] ...>)
+              - pattern: $CONN->real_query(<... $REQ[...] ...>)
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^\$?_(GET|POST|REQUEST|COOKIE|FILES)$
 
   - id: devsecops-framework.secure-coding.php.sql-string-concatenation
     languages: [php]
@@ -167,21 +189,42 @@ rules:
       remediation: >-
         Avoid shell execution. Where unavoidable, wrap every interpolated
         component in escapeshellarg and validate against an allow-list.
+    # Same two-group structure as the SQL rule: CI reported `missed lines: [82]`,
+    # the interpolated `system("ping -c 1 $_GET[host]")` case.
     patterns:
       - pattern-either:
-          - pattern: system($CMD)
-          - pattern: system($CMD, ...)
-          - pattern: exec($CMD)
-          - pattern: exec($CMD, ...)
-          - pattern: shell_exec($CMD)
-          - pattern: passthru($CMD)
-          - pattern: passthru($CMD, ...)
-          - pattern: popen($CMD, ...)
-          - pattern: proc_open($CMD, ...)
-          - pattern: pcntl_exec($CMD, ...)
-      - metavariable-regex:
-          metavariable: $CMD
-          regex: \$_(GET|POST|REQUEST|COOKIE)\b
+          # 1. Superglobal passed directly.
+          - patterns:
+              - pattern-either:
+                  - pattern: system($CMD)
+                  - pattern: system($CMD, ...)
+                  - pattern: exec($CMD)
+                  - pattern: exec($CMD, ...)
+                  - pattern: shell_exec($CMD)
+                  - pattern: passthru($CMD)
+                  - pattern: passthru($CMD, ...)
+                  - pattern: popen($CMD, ...)
+                  - pattern: proc_open($CMD, ...)
+                  - pattern: pcntl_exec($CMD, ...)
+              - metavariable-regex:
+                  metavariable: $CMD
+                  regex: \$_(GET|POST|REQUEST|COOKIE)\b
+          # 2. Superglobal interpolated into the command string.
+          - patterns:
+              - pattern-either:
+                  - pattern: system(<... $REQ[...] ...>)
+                  - pattern: system(<... $REQ[...] ...>, ...)
+                  - pattern: exec(<... $REQ[...] ...>)
+                  - pattern: exec(<... $REQ[...] ...>, ...)
+                  - pattern: shell_exec(<... $REQ[...] ...>)
+                  - pattern: passthru(<... $REQ[...] ...>)
+                  - pattern: popen(<... $REQ[...] ...>, ...)
+                  - pattern: proc_open(<... $REQ[...] ...>, ...)
+                  - pattern: pcntl_exec(<... $REQ[...] ...>, ...)
+              - metavariable-regex:
+                  metavariable: $REQ
+                  regex: ^\$?_(GET|POST|REQUEST|COOKIE)$
+      # Escaped forms are the mitigation and stay silent.
       - pattern-not: system(escapeshellarg(...))
       - pattern-not: system(escapeshellcmd(...))
       - pattern-not: exec(escapeshellarg(...))
@@ -242,22 +285,45 @@ rules:
       remediation: >-
         Resolve with realpath and verify the result is inside the intended
         directory. Reject traversal rather than stripping it.
+    # Same two-group structure: CI reported `missed lines: [116]`, the
+    # interpolated `file_get_contents("/var/data/$_GET[name]")` case.
     patterns:
       - pattern-either:
-          - pattern: file_get_contents($P)
-          - pattern: file_get_contents($P, ...)
-          - pattern: file($P)
-          - pattern: fopen($P, ...)
-          - pattern: readfile($P)
-          - pattern: unlink($P)
-          - pattern: file_put_contents($P, ...)
-          - pattern: copy($P, ...)
-          - pattern: rename($P, ...)
-          - pattern: opendir($P)
-          - pattern: scandir($P)
-      - metavariable-regex:
-          metavariable: $P
-          regex: \$_(GET|POST|REQUEST|COOKIE|FILES)\b
+          # 1. Superglobal passed directly as the path.
+          - patterns:
+              - pattern-either:
+                  - pattern: file_get_contents($P)
+                  - pattern: file_get_contents($P, ...)
+                  - pattern: file($P)
+                  - pattern: fopen($P, ...)
+                  - pattern: readfile($P)
+                  - pattern: unlink($P)
+                  - pattern: file_put_contents($P, ...)
+                  - pattern: copy($P, ...)
+                  - pattern: rename($P, ...)
+                  - pattern: opendir($P)
+                  - pattern: scandir($P)
+              - metavariable-regex:
+                  metavariable: $P
+                  regex: \$_(GET|POST|REQUEST|COOKIE|FILES)\b
+          # 2. Superglobal interpolated into the path string.
+          - patterns:
+              - pattern-either:
+                  - pattern: file_get_contents(<... $REQ[...] ...>)
+                  - pattern: file_get_contents(<... $REQ[...] ...>, ...)
+                  - pattern: file(<... $REQ[...] ...>)
+                  - pattern: fopen(<... $REQ[...] ...>, ...)
+                  - pattern: readfile(<... $REQ[...] ...>)
+                  - pattern: unlink(<... $REQ[...] ...>)
+                  - pattern: file_put_contents(<... $REQ[...] ...>, ...)
+                  - pattern: copy(<... $REQ[...] ...>, ...)
+                  - pattern: rename(<... $REQ[...] ...>, ...)
+                  - pattern: opendir(<... $REQ[...] ...>)
+                  - pattern: scandir(<... $REQ[...] ...>)
+              - metavariable-regex:
+                  metavariable: $REQ
+                  regex: ^\$?_(GET|POST|REQUEST|COOKIE|FILES)$
+      # basename() is the common correct mitigation and stays silent.
       - pattern-not: file_get_contents(basename(...))
       - pattern-not: fopen(basename(...), ...)
       - pattern-not: readfile(basename(...))

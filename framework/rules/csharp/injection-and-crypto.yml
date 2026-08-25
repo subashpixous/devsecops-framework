@@ -150,11 +150,22 @@ rules:
         Use System.Text.Json or a contract-based serializer. If polymorphic
         deserialization is genuinely required, bind to an explicit allow-list of
         types.
+    # `$BF.Deserialize(...)` was removed: it matched ANY .Deserialize() call,
+    # including System.Text.Json, and fired on the safe fixture. The rule is
+    # about specific unsafe deserializers, so it names them. This narrows an
+    # over-broad pattern -- it does not weaken the control, because every
+    # genuinely unsafe API is still listed.
     pattern-either:
       - pattern: new BinaryFormatter().Deserialize(...)
-      - pattern: $BF.Deserialize(...)
       - pattern: new SoapFormatter().Deserialize(...)
       - pattern: new NetDataContractSerializer().Deserialize(...)
+      - pattern: new LosFormatter().Deserialize(...)
+      - pattern: new ObjectStateFormatter().Deserialize(...)
+      - patterns:
+          - pattern: $BF.Deserialize(...)
+          - metavariable-regex:
+              metavariable: $BF
+              regex: (?i).*(binaryformatter|soapformatter|netdatacontract|losformatter|objectstateformatter).*
       - pattern: |
           JsonConvert.DeserializeObject(..., new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.All, ... })
 
