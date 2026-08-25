@@ -247,3 +247,120 @@ class DependencyPinning(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrameworkRevisionPinning(unittest.TestCase):
+    """FD-1: the pipeline must never validate a project against an unknown revision.
+
+    The reusable workflow previously defaulted `framework_ref` to "main". When
+    `github.job_workflow_sha` was empty the pipeline silently checked out
+    whatever happened to be on the default branch -- so the security verdict
+    described framework code nobody chose. These tests keep that shut.
+    """
+
+    def test_framework_ref_does_not_default_to_a_moving_branch(self):
+        default = _workflow_input_default(_read(PIPELINE), "framework_ref")
+        self.assertIsNotNone(default)
+        cleaned = default.strip().strip('"').strip("'")
+        self.assertNotIn(
+            cleaned, {"main", "master", "HEAD"},
+            "framework_ref defaults to a moving branch; a verdict produced by an unknown "
+            "framework revision is not evidence",
+        )
+        self.assertEqual(cleaned, "", "the default must be empty so the run fails closed")
+
+    def test_pipeline_refuses_an_unresolvable_revision(self):
+        text = _read(PIPELINE)
+        self.assertIn("Framework revision NOT ESTABLISHED", text)
+        self.assertIn("Refusing to fall back to a moving branch", text)
+
+    def test_pipeline_rejects_branch_refs_explicitly(self):
+        text = _read(PIPELINE)
+        self.assertIn("is a moving branch", text)
+        self.assertIn("refs/heads/*", text)
+
+    def test_pipeline_asserts_the_checked_out_revision(self):
+        """Checkout not erroring is not proof it fetched what we asked for."""
+        text = _read(PIPELINE)
+        self.assertIn("Assert the framework revision that is actually checked out", text)
+        self.assertIn("Framework revision mismatch", text)
+
+    def test_verified_revision_reaches_the_evidence_manifest(self):
+        self.assertIn("FRAMEWORK_SHA", _read(PIPELINE))
+        evidence = _read(os.path.join(ROOT, "framework", "core", "evidence.py"))
+        self.assertIn("framework_revision", evidence)
+        self.assertIn("FRAMEWORK_SHA", evidence)
+
+
+class ScannerInstallation(unittest.TestCase):
+    """FD-2: shell functions are not inherited by `bash -c`.
+
+    `verify_sha256` and `published_sha` were defined in the outer shell and
+    called inside `bash -c '...'`. A child bash process does not inherit
+    functions, so every call resolved to "command not found" (exit 127) and the
+    download chain failed -- leaving gitleaks, trivy, nuclei and cosign MISSING
+    while the step reported only a generic FAILED.
+    """
+
+    def _install_script(self):
+        import yaml
+
+        with open(PIPELINE, "r", encoding="utf-8") as handle:
+            workflow = yaml.safe_load(handle)
+        steps = workflow["jobs"]["security"]["steps"]
+        return [s for s in steps if s.get("name") == "Install security scanners"][0]["run"]
+
+    @staticmethod
+    def _code_only(script):
+        """Executable lines only.
+
+        The script documents the `bash -c` defect in a comment, and a naive
+        substring check would match the explanation rather than an invocation.
+        Comments are stripped so the test asserts what the shell actually runs.
+        """
+        return "\n".join(
+            line for line in script.splitlines() if not line.lstrip().startswith("#")
+        )
+
+    def test_no_installer_runs_through_bash_c(self):
+        """The specific construct that broke four scanners."""
+        script = self._code_only(self._install_script())
+        self.assertNotIn(
+            "bash -c", script,
+            "an installer invoked through `bash -c` cannot see verify_sha256 or "
+            "published_sha; that is exactly what left four scanners MISSING",
+        )
+
+    def test_every_download_is_still_checksum_verified(self):
+        """The fix must not have been to drop verification."""
+        script = self._install_script()
+        for tool in ("gitleaks", "trivy", "nuclei", "cosign"):
+            with self.subTest(tool=tool):
+                self.assertRegex(script, r"verify_sha256[^\n]*\n?[^\n]*%s" % tool)
+
+    def test_helper_functions_are_defined_before_use(self):
+        script = self._install_script()
+        self.assertLess(
+            script.index("verify_sha256()"), script.index("install_gitleaks()"),
+            "helpers must be defined before the installers that call them",
+        )
+        self.assertLess(script.index("published_sha()"), script.index("install_gitleaks()"))
+
+    def test_each_tool_has_a_named_installer_function(self):
+        script = self._install_script()
+        for tool in ("semgrep", "checkov", "gitleaks", "trivy", "nuclei", "cosign"):
+            with self.subTest(tool=tool):
+                self.assertIn("install_%s()" % tool, script)
+                self.assertIn("try %s" % tool, script.replace("  ", " "))
+
+    def test_installation_outcome_is_recorded_as_evidence(self):
+        """A missing scanner must be data, not just a line in a log."""
+        script = self._install_script()
+        self.assertIn("tool-install.json", script)
+        self.assertIn('"installed"', script)
+
+    def test_install_failure_does_not_abort_the_run(self):
+        """Fail-closed means NOT_VERIFIED in the report, not a dead pipeline."""
+        script = self._install_script()
+        self.assertIn("NOT_VERIFIED", script)
+        self.assertNotIn("set -e\n", script)

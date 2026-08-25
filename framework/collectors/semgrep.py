@@ -102,6 +102,49 @@ def _error_path(err: Any) -> str:
     return ""
 
 
+# A rule that fails to COMPILE is categorically different from a target file
+# that fails to PARSE. The first means a control we shipped never ran; the second
+# means one file was not read. Conflating them lets a broken rule of ours look
+# like a scanned-and-clean result, which is false execution credit -- the exact
+# thing the accounting model below exists to prevent.
+_RULE_ERROR_MARKERS = (
+    "invalid pattern", "invalid rule", "rule parse", "pattern parse",
+    "invalid_pattern", "patternparseerror", "ruleparseerror", "invalid-pattern",
+)
+
+
+def _rule_load_failures(errors: List[Any], known_rule_ids: Sequence[str]) -> Dict[str, str]:
+    """Rule ids the engine refused to load, mapped to the reason it gave.
+
+    Matching is deliberately generous: Semgrep's error shape varies by version
+    and by whether the failure came from the registry or a local file, so any
+    error mentioning one of our rule ids is treated as that rule failing to
+    load. An over-broad match here costs a rule its execution credit, which is
+    the safe direction to be wrong in.
+    """
+    failures: Dict[str, str] = {}
+    for err in errors or ():
+        text = _error_text(err)
+        looks_like_rule_error = any(marker in text for marker in _RULE_ERROR_MARKERS)
+
+        named = ""
+        if isinstance(err, dict):
+            for key in ("rule_id", "ruleId", "rule"):
+                value = err.get(key)
+                if isinstance(value, str) and value:
+                    named = value
+                    break
+
+        for rule_id in known_rule_ids:
+            lowered = rule_id.lower()
+            if named == rule_id or lowered in text:
+                if looks_like_rule_error or named == rule_id:
+                    failures[rule_id] = (
+                        err.get("message") or err.get("long_msg") or err.get("short_msg") or text
+                    ) if isinstance(err, dict) else text
+    return failures
+
+
 def _classify_errors(errors: List[Any]):
     """Split Semgrep errors into blocking failures and named unparsed files.
 
@@ -247,6 +290,42 @@ class SemgrepCollector(Collector):
 
         errors: List[Any] = payload.get("errors") or []
         blocking, unparsed = _classify_errors(errors)
+
+        # --- Truthful rule accounting (FD-3) -----------------------------
+        # A rule the engine refused to compile did NOT run. Until now the
+        # framework reported every SELECTED rule as executed, so six PHP rules
+        # that failed to load were still credited -- false execution credit for
+        # controls that never looked at a single line. The five figures below are
+        # the honest accounting, and EXECUTED is the only one that may be treated
+        # as coverage.
+        selected_ids = self.rule_selection.rules_executed  # naming is historic: these are SELECTED
+        load_failures = _rule_load_failures(errors, selected_ids)
+        executed_ids = [r for r in selected_ids if r not in load_failures]
+
+        accounting = {
+            "total": self.rule_selection.total_rules,
+            "selected": len(selected_ids),
+            "executed": len(executed_ids),
+            "failed_to_load": len(load_failures),
+            "skipped": len(self.rule_selection.rules_skipped),
+            "failed_to_load_detail": [
+                {"rule": rid, "reason": str(reason)[:400]}
+                for rid, reason in sorted(load_failures.items())
+            ],
+            "executed_rules": executed_ids,
+        }
+        result.metadata["rule_accounting"] = accounting
+
+        if load_failures:
+            # A rule of OURS that does not compile is a framework defect, and it
+            # costs real coverage. partial() keeps the findings that other rules
+            # did produce while denying the category a clean PASS it has not
+            # earned.
+            result.partial(
+                "%d framework secure-coding rule(s) FAILED TO LOAD and therefore did not run: "
+                "%s. The patterns they cover were NOT checked in this scan."
+                % (len(load_failures), ", ".join(sorted(load_failures)))
+            )
         finding_count = len(payload.get("results") or [])
 
         result.metadata["max_target_bytes"] = 2000000

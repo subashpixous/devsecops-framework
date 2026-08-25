@@ -71,6 +71,26 @@ SONARQUBE_RESULT_STALE = "SONARQUBE_RESULT_STALE"
 SONARQUBE_RESULT_UNAVAILABLE = "SONARQUBE_RESULT_UNAVAILABLE"
 SONARQUBE_PERMISSION_ERROR = "SONARQUBE_PERMISSION_ERROR"
 
+# Which SonarQube permission each read endpoint requires. When one of these
+# returns 401/403 the report can name the exact grant that is missing rather
+# than emitting a generic "permission error" an administrator cannot act on.
+#
+# Every endpoint this collector uses needs project-level "Browse". That matters
+# for diagnosis: a PROJECT ANALYSIS TOKEN carries only "Execute Analysis", which
+# is enough to submit a scan and NOT enough to read its results -- producing
+# exactly the symptom of an analysis job that succeeds while the collector is
+# refused.
+ENDPOINT_PERMISSIONS = {
+    "/api/server/version": "none (public endpoint)",
+    "/api/qualitygates/project_status": "Browse on the project",
+    "/api/issues/search": "Browse on the project",
+    "/api/hotspots/search": "Browse on the project",
+    "/api/project_analyses/search": "Browse on the project",
+    "/api/measures/component": "Browse on the project",
+    "/api/components/tree": "Browse on the project",
+    "/api/rules/show": "authenticated user",
+}
+
 ANALYSIS_STATES = (
     SONARQUBE_SCAN_COMPLETED,
     SONARQUBE_RESULT_STALE,
@@ -303,6 +323,9 @@ class SonarQubeCollector(Collector):
         # Set the moment any endpoint returns 401/403, so an authorisation
         # problem is reported as exactly that rather than as a generic failure.
         self.permission_denied = False
+        # Endpoint -> status, for every endpoint that refused us. A single bool
+        # cannot tell an administrator which permission to grant.
+        self.permission_denied_endpoints: Dict[str, int] = {}
 
     # -- HTTP -----------------------------------------------------------------
 
@@ -372,7 +395,7 @@ class SonarQubeCollector(Collector):
         """
         if self.branch and self.branch_supported:
             payload, error, status = self._get(path, dict(params, branch=self.branch))
-            self._note_status(status)
+            self._note_status(status, path)
             if payload is not None:
                 return payload, None
             if status in (400, 404):
@@ -385,10 +408,10 @@ class SonarQubeCollector(Collector):
                 return None, error
 
         payload, error, status = self._get(path, params)
-        self._note_status(status)
+        self._note_status(status, path)
         return payload, error
 
-    def _note_status(self, status: int) -> None:
+    def _note_status(self, status: int, path: str = "") -> None:
         """Record an authorisation failure seen on any endpoint.
 
         Detection lives here rather than only in the transport's exception
@@ -398,6 +421,8 @@ class SonarQubeCollector(Collector):
         """
         if status in (401, 403):
             self.permission_denied = True
+            if path:
+                self.permission_denied_endpoints[path] = status
 
     # -- Paging ---------------------------------------------------------------
 
@@ -770,10 +795,28 @@ class SonarQubeCollector(Collector):
         # only it permits the category to reach PASS.
         if self.permission_denied:
             state = SONARQUBE_PERMISSION_ERROR
+            refused = sorted(self.permission_denied_endpoints)
+            needed = sorted({
+                ENDPOINT_PERMISSIONS.get(endpoint, "Browse on the project")
+                for endpoint in refused
+            }) or ["Browse on the project"]
+            payload["permission_diagnosis"] = {
+                "refused_endpoints": {e: self.permission_denied_endpoints[e] for e in refused},
+                "permissions_required": needed,
+                "likely_cause": (
+                    "The token authenticates (the analysis submits successfully) but is not "
+                    "authorised to READ results. A SonarQube PROJECT ANALYSIS TOKEN carries only "
+                    "'Execute Analysis' and cannot read the reporting API. A User Token belonging "
+                    "to an account with 'Browse' on this project is required."
+                ),
+            }
+            result.metadata["refused_endpoints"] = refused
             result.fail(
-                "SONARQUBE_PERMISSION_ERROR: the supplied token was rejected (HTTP 401/403) by at "
-                "least one endpoint. The token is invalid, expired, or lacks 'Browse' permission "
-                "on project %r. No assertion about static analysis can be made." % project_key
+                "SONARQUBE_PERMISSION_ERROR: the supplied token was rejected (HTTP 401/403) on %s. "
+                "Required permission: %s on project %r. Note that a project ANALYSIS token can "
+                "submit a scan but cannot read its results -- a User Token with 'Browse' is "
+                "needed. No assertion about static analysis can be made."
+                % (", ".join(refused) or "at least one endpoint", "; ".join(needed), project_key)
             )
         elif result.errors:
             state = SONARQUBE_RESULT_UNAVAILABLE

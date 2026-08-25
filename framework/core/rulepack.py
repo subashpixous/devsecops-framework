@@ -120,6 +120,15 @@ class RulePackSelection:
     reason: str = ""
 
     @property
+    def total_rules(self) -> int:
+        """Every rule the pack contains, selected or not.
+
+        The denominator for the accounting model: TOTAL = SELECTED + SKIPPED,
+        and EXECUTED can never exceed SELECTED.
+        """
+        return len(self.rules_executed) + len(self.rules_skipped)
+
+    @property
     def config_paths(self) -> List[str]:
         return [rule_file.path for rule_file in self.selected]
 

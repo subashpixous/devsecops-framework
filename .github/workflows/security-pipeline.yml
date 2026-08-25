@@ -116,8 +116,14 @@ on:
         type: string
         default: "subashpixous/devsecops-framework"
       framework_ref:
+        description: >-
+          Immutable framework revision (full commit SHA, or a release tag). The
+          default is EMPTY on purpose: `github.job_workflow_sha` normally supplies
+          it, and when that context is unavailable the run must stop rather than
+          quietly resolve to a moving branch. A security verdict produced by an
+          unknown framework revision is not evidence of anything.
         type: string
-        default: "main"
+        default: ""
       artifact_name:
         type: string
         default: "security-results"
@@ -202,15 +208,76 @@ jobs:
           fetch-depth: 0          # full history: gitleaks scans past commits
           persist-credentials: false
 
+      - name: Resolve the framework revision (fail closed)
+        id: fwref
+        env:
+          JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
+          IN_FRAMEWORK_REF: ${{ inputs.framework_ref }}
+        run: |
+          set -euo pipefail
+          # Precedence: job_workflow_sha (the commit that defines this reusable
+          # workflow) then an explicit caller-supplied ref. There is deliberately
+          # no third option. The previous default of "main" meant that when the
+          # context was empty the pipeline silently validated the project against
+          # whatever happened to be on the framework's default branch.
+          ref="${JOB_WORKFLOW_SHA:-}"
+          source="github.job_workflow_sha"
+          if [ -z "$ref" ]; then
+            ref="${IN_FRAMEWORK_REF:-}"
+            source="inputs.framework_ref"
+          fi
+
+          if [ -z "$ref" ]; then
+            echo "::error::Framework revision NOT ESTABLISHED. github.job_workflow_sha was empty" \
+                 " and no framework_ref was supplied. Refusing to fall back to a moving branch:" \
+                 " a verdict from an unknown framework revision is not evidence. Pass" \
+                 " framework_ref set to the same immutable SHA or tag used in 'uses:'."
+            exit 1
+          fi
+
+          case "$ref" in
+            main|master|HEAD|refs/heads/*)
+              echo "::error::Framework revision '$ref' is a moving branch. Production runs must" \
+                   " pin an immutable revision (full commit SHA or release tag)."
+              exit 1 ;;
+          esac
+
+          echo "resolved=$ref"    >> "$GITHUB_OUTPUT"
+          echo "source=$source"   >> "$GITHUB_OUTPUT"
+          echo "Framework revision resolved to $ref (from $source)"
+
       - name: Checkout security framework
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           repository: ${{ inputs.framework_repository }}
-          # job_workflow_sha pins the framework to exactly the commit that defines
-          # this reusable workflow, so code and workflow can never drift apart.
-          ref: ${{ github.job_workflow_sha || inputs.framework_ref }}
+          ref: ${{ steps.fwref.outputs.resolved }}
           path: framework
           persist-credentials: false
+
+      - name: Assert the framework revision that is actually checked out
+        working-directory: framework
+        env:
+          EXPECTED: ${{ steps.fwref.outputs.resolved }}
+          REF_SOURCE: ${{ steps.fwref.outputs.source }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "expected : $EXPECTED (from $REF_SOURCE)"
+          echo "actual   : $actual"
+          echo "version  : $(cat VERSION 2>/dev/null || echo NOT_ESTABLISHED)"
+
+          # A tag resolves to a SHA, so compare on the resolvable form rather than
+          # on string equality. What must hold is that HEAD is the revision we
+          # asked for -- not merely that checkout did not error.
+          if [ "$actual" != "$EXPECTED" ]; then
+            resolved="$(git rev-parse "$EXPECTED^{commit}" 2>/dev/null || echo "")"
+            if [ "$resolved" != "$actual" ]; then
+              echo "::error::Framework revision mismatch. Asked for '$EXPECTED', got '$actual'."
+              exit 1
+            fi
+          fi
+          echo "FRAMEWORK_SHA=$actual" >> "$GITHUB_ENV"
+          echo "Framework revision verified."
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
@@ -244,13 +311,28 @@ jobs:
           install_log=/tmp/tool-install.log
           : > "$install_log"
 
+          # Machine-readable install record. The framework ingests this so a
+          # missing scanner is EVIDENCE rather than a line in a log nobody reads.
+          install_record=/tmp/tool-install.json
+          : > "$install_record"
+
           try() {
-            echo "--- installing $1 ---" | tee -a "$install_log"
+            local name="$1"
+            echo "--- installing $name ---" | tee -a "$install_log"
             shift
+            # NOTE: "$@" is invoked in THIS shell, never through `bash -c`.
+            # Shell functions are not exported to child processes, so a helper
+            # called from inside `bash -c` resolves to "command not found"
+            # (exit 127) and every download silently reported FAILED. That was
+            # the defect that left gitleaks, trivy, nuclei and cosign MISSING.
             if "$@" >>"$install_log" 2>&1; then
               echo "    OK"
+              printf '{"tool":"%s","installed":true,"reason":""}\n' "$name" >> "$install_record"
             else
-              echo "    FAILED (category will report NOT_VERIFIED)"
+              local rc=$?
+              echo "    FAILED rc=$rc (category will report NOT_VERIFIED)"
+              printf '{"tool":"%s","installed":false,"reason":"installer exited %d"}\n' \
+                "$name" "$rc" >> "$install_record"
             fi
           }
 
@@ -287,49 +369,83 @@ jobs:
             echo "    checksum verified for $name" >>"$install_log"
           }
 
-          try semgrep python -m pip install --quiet semgrep
-          try checkov python -m pip install --quiet checkov
-
           # Look up one artefact's digest in a release checksums file.
           published_sha() {
             local url="$1" artefact="$2"
             curl -sSfL "$url" 2>/dev/null | grep -F " $artefact" | head -1 | awk '{print $1}' || true
           }
 
-          try gitleaks bash -c '
-            base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
-            artefact="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-            curl -sSfL -o /tmp/gitleaks.tar.gz "${base}/${artefact}" &&
-            verify_sha256 /tmp/gitleaks.tar.gz "$(published_sha "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" "$artefact")" gitleaks &&
-            tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks'
+          # One installer function per tool, each executed IN THIS SHELL so it
+          # can see verify_sha256 and published_sha. Every download is still
+          # checksum-verified; nothing here bypasses verification.
+          install_semgrep() { python -m pip install --quiet semgrep; }
+          install_checkov() { python -m pip install --quiet checkov; }
 
-          try trivy bash -c '
-            base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
-            artefact="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-            curl -sSfL -o /tmp/trivy.tar.gz "${base}/${artefact}" &&
-            verify_sha256 /tmp/trivy.tar.gz "$(published_sha "${base}/trivy_${TRIVY_VERSION}_checksums.txt" "$artefact")" trivy &&
-            tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy'
+          install_gitleaks() {
+            local base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+            local artefact="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            curl -sSfL -o /tmp/gitleaks.tar.gz "${base}/${artefact}" || return 1
+            verify_sha256 /tmp/gitleaks.tar.gz \
+              "$(published_sha "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" "$artefact")" \
+              gitleaks || return 1
+            tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+          }
 
-          try nuclei bash -c '
-            base="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}"
-            artefact="nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
-            curl -sSfL -o /tmp/nuclei.zip "${base}/${artefact}" &&
-            verify_sha256 /tmp/nuclei.zip "$(published_sha "${base}/nuclei_${NUCLEI_VERSION}_checksums.txt" "$artefact")" nuclei &&
-            unzip -oq /tmp/nuclei.zip -d /usr/local/bin nuclei'
+          install_trivy() {
+            local base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+            local artefact="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+            curl -sSfL -o /tmp/trivy.tar.gz "${base}/${artefact}" || return 1
+            verify_sha256 /tmp/trivy.tar.gz \
+              "$(published_sha "${base}/trivy_${TRIVY_VERSION}_checksums.txt" "$artefact")" \
+              trivy || return 1
+            tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+          }
+
+          install_nuclei() {
+            local base="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}"
+            local artefact="nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
+            curl -sSfL -o /tmp/nuclei.zip "${base}/${artefact}" || return 1
+            verify_sha256 /tmp/nuclei.zip \
+              "$(published_sha "${base}/nuclei_${NUCLEI_VERSION}_checksums.txt" "$artefact")" \
+              nuclei || return 1
+            unzip -oq /tmp/nuclei.zip -d /usr/local/bin nuclei
+          }
 
           # cosign is pinned to a version rather than "latest": a floating
           # download makes the evidence manifest record a version nobody chose,
           # and cosign is the tool that verifies everyone else's signatures.
-          try cosign bash -c '
-            base="https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}"
-            curl -sSfL -o /tmp/cosign "${base}/cosign-linux-amd64" &&
-            verify_sha256 /tmp/cosign "$(published_sha "${base}/cosign_checksums.txt" "cosign-linux-amd64")" cosign &&
-            install -m 0755 /tmp/cosign /usr/local/bin/cosign'
+          install_cosign() {
+            local base="https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}"
+            curl -sSfL -o /tmp/cosign "${base}/cosign-linux-amd64" || return 1
+            verify_sha256 /tmp/cosign \
+              "$(published_sha "${base}/cosign_checksums.txt" "cosign-linux-amd64")" \
+              cosign || return 1
+            install -m 0755 /tmp/cosign /usr/local/bin/cosign
+          }
+
+          try semgrep  install_semgrep
+          try checkov  install_checkov
+          try gitleaks install_gitleaks
+          try trivy    install_trivy
+          try nuclei   install_nuclei
+          try cosign   install_cosign
 
           echo "=== scanner availability ==="
+          missing=0
           for t in semgrep gitleaks trivy checkov nuclei cosign docker; do
-            printf '  %-10s %s\n' "$t" "$(command -v "$t" >/dev/null && echo AVAILABLE || echo MISSING)"
+            if command -v "$t" >/dev/null; then
+              printf '  %-10s AVAILABLE  %s\n' "$t" "$(command -v "$t")"
+            else
+              printf '  %-10s MISSING\n' "$t"
+              missing=$((missing + 1))
+            fi
           done
+          echo "missing_count=$missing"
+
+          # Deliberately NOT a failure of this step. A missing scanner must reach
+          # the report as NOT_VERIFIED rather than aborting the run -- that is the
+          # fail-closed contract. It is recorded so it cannot pass unnoticed.
+          cp "$install_record" "${GITHUB_WORKSPACE}/tool-install.json" 2>/dev/null || true
 
       - name: Report scanner availability
         working-directory: framework

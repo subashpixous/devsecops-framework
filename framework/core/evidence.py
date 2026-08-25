@@ -168,6 +168,11 @@ def _build(
             "framework_name": framework.get("name", ""),
             "framework_version": framework.get("version", "NOT_ESTABLISHED"),
             "workflow_ref": workflow_ref or os.environ.get("GITHUB_WORKFLOW_SHA", "NOT_ESTABLISHED"),
+            # The framework revision the pipeline VERIFIED it checked out, not the
+            # one it intended to. Set by the workflow's assertion step, so the
+            # evidence pack records which framework code produced this verdict
+            # rather than leaving it to be inferred from a log line.
+            "framework_revision": os.environ.get("FRAMEWORK_SHA", "NOT_ESTABLISHED"),
             "active_phase": framework.get("active_phase", "NOT_ESTABLISHED"),
             "python_version": sys.version.split()[0],
             "platform": platform.platform(),

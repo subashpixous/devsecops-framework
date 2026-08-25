@@ -535,38 +535,61 @@ def render_markdown(
         # never executed must not read the same as "no finding" from one that
         # did.
         pack = {}
+        accounting = {}
         engine_completed = False
         for scanner in report.get("scanners") or []:
-            declared = (scanner.get("metadata") or {}).get("secure_coding_rules")
+            metadata = scanner.get("metadata") or {}
+            declared = metadata.get("secure_coding_rules")
             if declared:
                 pack = declared
-                # Selecting a rule is not running it. If the engine that executes
-                # our rules did not complete, NOTHING in this pack was applied --
-                # and saying otherwise would be exactly the overclaim the rest of
-                # this report exists to prevent.
+                accounting = metadata.get("rule_accounting") or {}
+                # Selecting a rule is not running it, and neither is loading it.
+                # If the engine did not complete, NOTHING in this pack applied.
                 engine_completed = scanner.get("status") == "OK" and not scanner.get("errors")
                 break
         if pack:
-            selected = pack.get("rules_executed_count", 0)
+            selected = accounting.get("selected", pack.get("rules_executed_count", 0))
+            skipped = accounting.get("skipped", pack.get("rules_skipped_count", 0))
+            total = accounting.get("total", selected + skipped)
+            failed = accounting.get("failed_to_load", 0)
+            # EXECUTED must be earned twice over: the engine completed, AND the
+            # rule compiled. Either failure means the control did not run.
+            executed = accounting.get("executed", 0) if engine_completed else 0
+
             add("**Framework secure-coding rule pack**")
             add("")
-            add("| Measure | Value |")
-            add("|---|---|")
-            add("| Rules applicable to this project | %d |" % selected)
-            add("| Rules NOT applicable | %d |" % pack.get("rules_skipped_count", 0))
-            add("| Detected languages | %s |"
-                % (_escape(", ".join(pack.get("detected_languages") or [])) or "none detected"))
-            add("| **Rules actually executed** | %s |" % (
-                "**%d**" % selected if engine_completed
-                else "**0 — the engine did not complete**"
-            ))
+            add("| Measure | Count |")
+            add("|---|---:|")
+            add("| TOTAL rules in pack | %d |" % total)
+            add("| SELECTED for this project | %d |" % selected)
+            add("| **EXECUTED** | **%d** |" % executed)
+            add("| **FAILED_TO_LOAD** | **%d** |" % failed)
+            add("| SKIPPED (language not present) | %d |" % skipped)
             add("")
+            add("Detected languages: %s"
+                % (_escape(", ".join(pack.get("detected_languages") or [])) or "none detected"))
+            add("")
+
             if not engine_completed:
-                add("> **No framework secure-coding rule ran in this scan.** The rules below were "
-                    "selected for this project, but the engine that executes them "
+                add("> **EXECUTED = 0. No framework secure-coding rule ran in this scan.** The "
+                    "rules were selected for this project, but the engine that executes them "
                     "(Semgrep/OpenGrep) did not complete, so none was applied. Absence of "
                     "findings from this pack is NOT evidence that these patterns are absent.")
                 add("")
+            elif failed:
+                add("> **%d rule(s) FAILED TO LOAD and did not run.** The engine refused to "
+                    "compile them, so the patterns they cover were NOT checked. This is a defect "
+                    "in the framework's own rules, not in the scanned project." % failed)
+                add("")
+                add("| Rule that did not run | Reason given by the engine |")
+                add("|---|---|")
+                for entry in accounting.get("failed_to_load_detail") or []:
+                    add("| `%s` | %s |" % (
+                        _escape(entry.get("rule", "")),
+                        _escape(_truncate(entry.get("reason", ""), 90)),
+                    ))
+                add("")
+
             add("%s" % _escape(pack.get("statement", "")))
             add("")
             skipped_files = pack.get("files_skipped") or []

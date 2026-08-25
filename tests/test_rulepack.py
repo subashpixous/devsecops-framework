@@ -396,3 +396,127 @@ class FixtureCoverage(unittest.TestCase):
                         "ok: %s" % rule_id, body,
                         "no safe fixture case asserts that %s stays silent" % rule_id,
                     )
+
+
+# --- Truthful rule accounting (FD-3) ----------------------------------------
+#
+# A rule the engine refused to compile did NOT run. The framework previously
+# reported every SELECTED rule as executed, so six PHP rules that failed to load
+# were still credited with coverage they never provided. These tests hold the
+# five figures -- TOTAL / SELECTED / EXECUTED / FAILED_TO_LOAD / SKIPPED -- to
+# the rule that EXECUTED must be earned.
+
+
+class RuleAccounting(unittest.TestCase):
+    def _accounting(self, engine_errors, languages=("php",)):
+        """Run the collector against a stubbed engine returning `engine_errors`."""
+        import json as _json
+
+        from framework.collectors import semgrep as mod
+
+        collector = SemgrepCollector(languages=list(languages))
+        selected = collector.rule_selection.rules_executed
+        payload = {"results": [], "errors": engine_errors, "paths": {"scanned": []}}
+
+        # Mirrors framework.core.toolrunner.ToolResult closely enough for
+        # accepted() -- which checks available/timed_out/error/returncode. Using
+        # the real contract rather than a looser stub is deliberate: a stub that
+        # diverges would let the test pass while production fails.
+        class _Proc:
+            available = True
+            timed_out = False
+            error = ""
+            returncode = 0
+            stdout = _json.dumps(payload)
+            stderr = ""
+            duration_seconds = 0.1
+
+            def to_dict(self):
+                return {"returncode": 0, "argv": ["semgrep", "scan"], "duration": 0.1}
+
+            def summary(self):
+                return "ok"
+
+        original_run, original_avail, original_ver = mod.run, mod.tool_available, mod.tool_version
+        mod.run = lambda *a, **k: _Proc()
+        mod.tool_available = lambda *a, **k: True
+        mod.tool_version = lambda *a, **k: "1.0.0"
+        try:
+            result = collector.collect()
+        finally:
+            mod.run, mod.tool_available, mod.tool_version = original_run, original_avail, original_ver
+        return result, result.metadata.get("rule_accounting"), selected
+
+    def test_clean_run_credits_every_selected_rule(self):
+        result, acc, selected = self._accounting([])
+        self.assertEqual(acc["selected"], len(selected))
+        self.assertEqual(acc["executed"], len(selected))
+        self.assertEqual(acc["failed_to_load"], 0)
+        self.assertTrue(result.is_trustworthy)
+
+    def test_total_equals_selected_plus_skipped(self):
+        _, acc, _ = self._accounting([])
+        self.assertEqual(acc["total"], acc["selected"] + acc["skipped"])
+
+    def test_a_rule_that_fails_to_load_is_not_credited_as_executed(self):
+        """THE regression test for false execution credit."""
+        _, acc, selected = self._accounting([])
+        victim = selected[0]
+
+        _, acc2, _ = self._accounting([
+            {"type": "Invalid pattern", "rule_id": victim,
+             "message": "Invalid pattern for PHP"}
+        ])
+        self.assertEqual(acc2["failed_to_load"], 1)
+        self.assertEqual(acc2["executed"], acc2["selected"] - 1)
+        self.assertNotIn(victim, acc2["executed_rules"])
+
+    def test_failed_rule_is_named_with_its_reason(self):
+        _, acc, selected = self._accounting([])
+        victim = selected[0]
+        _, acc2, _ = self._accounting([
+            {"type": "Invalid pattern", "rule_id": victim, "message": "Invalid pattern for PHP"}
+        ])
+        detail = acc2["failed_to_load_detail"]
+        self.assertEqual(detail[0]["rule"], victim)
+        self.assertIn("Invalid pattern", detail[0]["reason"])
+
+    def test_rule_load_failure_denies_a_clean_pass(self):
+        """A control that never ran must not leave the category trustworthy."""
+        _, _, selected = self._accounting([])
+        result, _, _ = self._accounting([
+            {"type": "Invalid pattern", "rule_id": selected[0], "message": "Invalid pattern for PHP"}
+        ])
+        self.assertFalse(
+            result.is_trustworthy,
+            "a framework rule that failed to load costs real coverage; the category "
+            "must not be assertable as PASS",
+        )
+        self.assertTrue(any("FAILED TO LOAD" in w for w in result.warnings))
+
+    def test_six_failed_rules_are_all_accounted(self):
+        """The TNCWWB shape: six PHP rules refused by the engine."""
+        _, _, selected = self._accounting([])
+        victims = selected[:6]
+        _, acc, _ = self._accounting([
+            {"type": "Invalid pattern", "rule_id": v, "message": "Invalid pattern for PHP"}
+            for v in victims
+        ])
+        self.assertEqual(acc["failed_to_load"], 6)
+        self.assertEqual(acc["executed"], acc["selected"] - 6)
+        for v in victims:
+            self.assertNotIn(v, acc["executed_rules"])
+
+    def test_target_file_parse_errors_do_not_reduce_rule_credit(self):
+        """A file the parser could not read is not a rule that failed to load."""
+        _, acc, selected = self._accounting([
+            {"type": "SyntaxError", "path": "legacy/weird.php", "message": "syntax error"}
+        ])
+        self.assertEqual(acc["failed_to_load"], 0)
+        self.assertEqual(acc["executed"], len(selected))
+
+    def test_engine_never_running_credits_nothing(self):
+        collector = SemgrepCollector(languages=["php"], binary="definitely-not-installed")
+        result = collector.collect()
+        self.assertFalse(result.is_trustworthy)
+        self.assertNotIn("rule_accounting", result.metadata)
