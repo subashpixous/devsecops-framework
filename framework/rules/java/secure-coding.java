@@ -9,7 +9,10 @@ import java.security.MessageDigest;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import javax.servlet.http.HttpServletResponse;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.slf4j.Logger;
 import org.springframework.http.ResponseEntity;
 
@@ -92,34 +95,51 @@ public class SecureCodingSamples {
     private void risky() throws Exception { }
 }
 
+// The type is written with the short name, as real code does after importing it.
+// A fully-qualified `java.security.cert.X509Certificate[]` is a different AST
+// node from the pattern's `X509Certificate[]`, so the earlier fixture never
+// exercised this rule at all -- the fixture was wrong, not the rule.
 class TrustManagerSamples {
     // ruleid: devsecops-framework.secure-coding.java.trust-all-certificates
-    public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) { }
+    public void checkServerTrusted(X509Certificate[] chain, String authType) { }
+
+    // ruleid: devsecops-framework.secure-coding.java.trust-all-certificates
+    public void checkClientTrusted(X509Certificate[] chain, String authType) { }
 }
 
 class TrustManagerSafeSamples {
+    // The pattern requires an EMPTY body. A manager that actually validates has
+    // a body and is correctly not flagged.
     // ok: devsecops-framework.secure-coding.java.trust-all-certificates
-    public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType)
-            throws java.security.cert.CertificateException {
+    public void checkServerTrusted(X509Certificate[] chain, String authType)
+            throws CertificateException {
         if (chain == null || chain.length == 0) {
-            throw new java.security.cert.CertificateException("empty chain");
+            throw new CertificateException("empty chain");
         }
     }
 }
 
+// Real Spring Security configuration. The earlier fixture called an invented
+// `csrfOf(http)` helper, which no rule targets and which therefore proved
+// nothing -- again a defect in the fixture rather than in the rule.
 class SecurityConfigSamples {
-    public void configure(Object http) {
+    public void configure(HttpSecurity http) throws Exception {
         // ruleid: devsecops-framework.secure-coding.java.csrf-disabled
-        csrfOf(http).disable();
-
-        // ok: devsecops-framework.secure-coding.java.csrf-disabled
-        csrfOf(http).enable();
+        http.csrf().disable();
     }
+}
 
-    private CsrfSpec csrfOf(Object http) { return new CsrfSpec(); }
+class SecurityConfigLambdaSamples {
+    public void configure(HttpSecurity http) throws Exception {
+        // ruleid: devsecops-framework.secure-coding.java.csrf-disabled
+        http.csrf(c -> c.disable());
+    }
+}
 
-    static class CsrfSpec {
-        void disable() { }
-        void enable() { }
+class SecurityConfigSafeSamples {
+    public void configure(HttpSecurity http) throws Exception {
+        // CSRF left enabled: configured, not disabled.
+        // ok: devsecops-framework.secure-coding.java.csrf-disabled
+        http.csrf();
     }
 }
