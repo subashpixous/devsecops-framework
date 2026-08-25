@@ -108,14 +108,29 @@ rules:
       remediation: >-
         Wrap the call in `if (env.IsDevelopment())` and register
         UseExceptionHandler for other environments.
+    # NOTE ON PATTERN FORM: the guards below bind a metavariable to the receiver
+    # rather than writing `if (...IsDevelopment())`. An ellipsis used as an
+    # expression PREFIX is a partial expression, which Semgrep rejects -- and it
+    # rejected this rule with PatternParseError, which in turn dropped the rule
+    # from the loaded set and made its fixture annotation unresolvable.
     patterns:
       - pattern: $APP.UseDeveloperExceptionPage(...);
       - pattern-not-inside: |
-          if (...IsDevelopment()) { ... }
+          if ($ENV.IsDevelopment()) { ... }
       - pattern-not-inside: |
-          if (...IsEnvironment(...)) { ... }
+          if ($ENV.IsDevelopment(...)) { ... }
       - pattern-not-inside: |
-          if ($ENV.EnvironmentName == ...) { ... }
+          if ($ENV.IsEnvironment(...)) { ... }
+      - pattern-not-inside: |
+          if ($ENV.EnvironmentName == $NAME) { ... }
+      # The if/else shape is spelled out explicitly rather than excluded with a
+      # bare `if ($COND) { ... } else { ... }`. That catch-all would suppress the
+      # rule inside ANY conditional -- weakening the control to make a fixture
+      # pass, which is not a fix.
+      - pattern-not-inside: |
+          if ($ENV.IsDevelopment()) { ... } else { ... }
+      - pattern-not-inside: |
+          if ($ENV.IsEnvironment(...)) { ... } else { ... }
 
   - id: devsecops-framework.secure-coding.csharp.database-error-detail-in-response
     languages: [csharp]
