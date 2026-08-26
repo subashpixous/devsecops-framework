@@ -28,6 +28,9 @@ from framework.core.coverage import (  # noqa: E402
     BUCKET_NO_ENGINE,
     BUCKET_NOT_CODE,
     BUCKET_SCANNER_FAILED,
+    SCANNER_COMPLETED_DEGRADED,
+    SCANNER_FAILED_TO_COMPLETE,
+    SCANNER_UNAVAILABLE,
     build_manifest,
     scan_coverage_from_results,
 )
@@ -320,3 +323,107 @@ class EngineCouldNotParse(unittest.TestCase):
         self.assertEqual(manifest["counts"]["no_scanner_for_filetype"], 0)
         self.assertEqual(manifest["counts"]["scanner_did_not_complete"], 0)
         self.assertEqual(manifest["counts"]["engine_could_not_parse"], 1)
+
+
+class RanButDegradedIsNotAFailure(unittest.TestCase):
+    """A tool that exits 0 and returns a valid report has COMPLETED.
+
+    The census previously had no state for "ran cleanly, result judged
+    degraded", so a PARTIAL result fell through to `scanner_failed` and was
+    published as "did NOT complete". For Trivy SCA on a project with no
+    dependency manifest that sentence was simply false: the process exited 0 in
+    5.5s with a valid SchemaVersion-2 report and no stderr.
+
+    The distinction matters because the two conditions have different owners. A
+    scanner that failed is the runner's problem; an empty dependency inventory
+    is the project's. Coverage credit is identical either way -- nothing -- so
+    this is about what the report SAYS, which for this framework is the product.
+    """
+
+    def _sca_result(self, warning="Trivy returned no 'Results' section."):
+        """Trivy SCA as a real run leaves it: ran, valid output, no inventory."""
+        result = ScannerResult(tool="trivy-sca", category_key="sca_dependencies")
+        plan = scanpaths.resolve("sca", ["php"])
+        result.metadata["coverage"] = {
+            "exclusions": plan.to_dict(),
+            "extensions": [],  # SCA declares no extension filter: every file is in scope
+        }
+        result.payload = {"SchemaVersion": 2}
+        result.partial(warning)   # degradation recorded, NO error
+        result.succeed()          # happy path still runs; degraded blocks promotion
+        return result
+
+    def _row(self, result, files=("index.php", "app/Model.php")):
+        workspace = Workspace(list(files))
+        self.addCleanup(workspace.cleanup)
+        manifest = build_manifest(workspace.root, [result], ["php"])
+        rows = {r["tool"]: r for r in manifest["per_scanner"]}
+        return manifest, rows["trivy-sca"]
+
+    def test_a_partial_result_without_errors_is_not_reported_as_failed(self):
+        """The exact TNCWWB Trivy defect."""
+        _, row = self._row(self._sca_result())
+        self.assertEqual(row["status"], SCANNER_COMPLETED_DEGRADED)
+        self.assertNotEqual(
+            row["status"], SCANNER_FAILED_TO_COMPLETE,
+            "a process that exited 0 with a valid report did not fail",
+        )
+
+    def test_the_reason_is_the_collectors_own_warning_not_a_generic_failure(self):
+        _, row = self._row(self._sca_result("no lockfile or manifest was recognised"))
+        self.assertIn("no lockfile or manifest was recognised", row["status_reason"])
+        self.assertNotIn("did not complete successfully", row["status_reason"])
+
+    def test_the_published_sentence_does_not_claim_the_scanner_failed(self):
+        _, row = self._row(self._sca_result())
+        statement = row["statement"]
+        self.assertNotIn("did NOT complete", statement)
+        self.assertIn("ran to completion", statement)
+        self.assertIn("degraded", statement)
+
+    def test_nothing_is_credited_to_a_degraded_scanner(self):
+        """The fix must not buy a truthful label with a false coverage claim."""
+        _, row = self._row(self._sca_result())
+        self.assertEqual(row["analysed"], 0)
+        self.assertFalse(row["completed"])
+
+    def test_it_is_excluded_from_the_scanners_failed_note(self):
+        manifest, _ = self._row(self._sca_result())
+        self.assertNotIn("trivy-sca", manifest["scanners_failed"])
+        joined = " ".join(manifest["notes"])
+        self.assertNotIn("Scanner(s) that did NOT complete: trivy-sca", joined)
+
+    def test_it_is_still_reported_and_never_silently_dropped(self):
+        manifest, row = self._row(self._sca_result())
+        self.assertIn("trivy-sca", [r["tool"] for r in manifest["per_scanner"]])
+        self.assertIn("degraded result", " ".join(manifest["notes"]))
+        self.assertTrue(row["status_reason"])
+
+    def test_a_recorded_error_still_reports_a_real_failure(self):
+        """Only an error-free PARTIAL is a completion. A failure stays a failure."""
+        result = ScannerResult(tool="trivy-sca", category_key="sca_dependencies")
+        plan = scanpaths.resolve("sca", ["php"])
+        result.metadata["coverage"] = {"exclusions": plan.to_dict(), "extensions": []}
+        result.fail("trivy did not complete: exit 2")
+        _, row = self._row(result)
+        self.assertEqual(row["status"], SCANNER_FAILED_TO_COMPLETE)
+        self.assertIn("did NOT complete", row["statement"])
+
+    def test_a_missing_binary_is_still_reported_as_unavailable(self):
+        """The unavailable branch must keep priority over the degraded branch."""
+        result = ScannerResult(tool="trivy-sca", category_key="sca_dependencies")
+        plan = scanpaths.resolve("sca", ["php"])
+        result.metadata["coverage"] = {"exclusions": plan.to_dict(), "extensions": []}
+        result.fail("trivy is not installed or not on PATH")
+        _, row = self._row(result)
+        self.assertEqual(row["status"], SCANNER_UNAVAILABLE)
+
+    def test_headline_coverage_is_unchanged_by_a_degraded_sca_scanner(self):
+        """SCA is not SAST: it must not move the coverage percentage either way."""
+        sast = declaring_result("semgrep", "sast")
+        workspace = Workspace(["index.php", "app/Model.php"])
+        self.addCleanup(workspace.cleanup)
+        before = build_manifest(workspace.root, [sast], ["php"])
+        after = build_manifest(workspace.root, [sast, self._sca_result()], ["php"])
+        self.assertEqual(before["coverage_percent"], after["coverage_percent"])
+        self.assertEqual(after["counts"]["scanner_did_not_complete"], 0)

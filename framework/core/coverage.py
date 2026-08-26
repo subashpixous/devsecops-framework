@@ -99,6 +99,18 @@ SCANNER_UNAVAILABLE = "scanner_unavailable"
 SCANNER_FAILED_TO_COMPLETE = "scanner_failed"
 SCANNER_NOT_APPLICABLE = "not_applicable"
 SCANNER_NO_DECLARATION = "coverage_not_declared"
+# The tool ran to completion and returned a valid result, but the collector
+# recorded a degradation meaning nothing may be credited to it -- most often
+# "the scan found nothing to inventory", which is a real gap in what is KNOWN
+# without being a failure of the tool.
+#
+# This exists because the census previously had no way to say it. A PARTIAL
+# result fell through to SCANNER_FAILED_TO_COMPLETE and was published as "did
+# NOT complete", which is false for a process that exited 0 with a valid report.
+# Coverage credit is deliberately unchanged -- a degraded result still earns
+# nothing -- so only the stated reason moves, and a reader can now tell a broken
+# scanner from an empty inventory.
+SCANNER_COMPLETED_DEGRADED = "completed_degraded"
 
 # Phrases a collector uses when the tool is absent. Matching on them lets the
 # census distinguish "the tool was not installed" from "the tool ran and broke",
@@ -238,6 +250,18 @@ def _classify_scanner_status(result: Any, declared: bool) -> Tuple[str, str]:
     if any(marker in blob for marker in _UNAVAILABLE_MARKERS):
         return SCANNER_UNAVAILABLE, (
             errors[0] if errors else "The scanner binary was not available on this runner."
+        )
+    # PARTIAL with no recorded error is a tool that RAN and returned a valid
+    # result the collector then judged degraded. Reporting that as "did not
+    # complete successfully" states something the evidence contradicts, and the
+    # two have different owners: a failure is the runner's problem, an empty
+    # inventory is the project's. The collector's own warning is the reason,
+    # because it is the only thing that knows why the result was degraded.
+    if status == "PARTIAL" and not errors:
+        return SCANNER_COMPLETED_DEGRADED, (
+            warnings[0] if warnings else
+            "The scanner ran to completion but returned a degraded result, so nothing is "
+            "credited to it."
         )
     return SCANNER_FAILED_TO_COMPLETE, (
         errors[0] if errors else "The scanner did not complete successfully."
@@ -464,6 +488,7 @@ def _build_manifest(
     # and listing it three times reads as three separate problems.
     unavailable = sorted({r["tool"] for r in per_scanner if r["status"] == SCANNER_UNAVAILABLE})
     failed = sorted({r["tool"] for r in per_scanner if r["status"] == SCANNER_FAILED_TO_COMPLETE})
+    degraded = sorted({r["tool"] for r in per_scanner if r["status"] == SCANNER_COMPLETED_DEGRADED})
     if unavailable:
         notes.append(
             "Scanner(s) NOT AVAILABLE on this runner: %s. Files those scanners would have read "
@@ -474,6 +499,13 @@ def _build_manifest(
         notes.append(
             "Scanner(s) that did NOT complete: %s. Their categories are NOT_VERIFIED and no file "
             "is credited to them." % ", ".join(failed)
+        )
+    if degraded:
+        notes.append(
+            "Scanner(s) that RAN but returned a degraded result: %s. The tool completed; nothing "
+            "is credited to them because the result cannot support a coverage claim. This is a "
+            "different condition from a scanner that failed, and a different owner: see each "
+            "scanner's own reason above." % ", ".join(degraded)
         )
 
     return {
@@ -607,6 +639,21 @@ def _scanner_statement(row: Dict[str, Any]) -> str:
 
     if row["status"] == SCANNER_NOT_APPLICABLE:
         return "%s did not apply to this project: %s" % (label, row["status_reason"])
+
+    # Ran, returned a valid result, and was judged degraded. Saying it "did not
+    # complete" would contradict its own execution record, so the sentence
+    # states what happened and hands the reader the collector's reason.
+    if row["status"] == SCANNER_COMPLETED_DEGRADED:
+        if not row.get("file_level", True):
+            return (
+                "%s ran to completion but returned a degraded result, so nothing is credited "
+                "to it: %s" % (label, row["status_reason"])
+            )
+        return (
+            "%s ran to completion but returned a degraded result, so none of the %d file(s) in "
+            "its scope is credited to it: %s"
+            % (label, row["in_scope"], row["status_reason"])
+        )
 
     # Without a declared reach there is no denominator, so the sentence says
     # what is true -- nothing is credited -- and does not invent a file count.
