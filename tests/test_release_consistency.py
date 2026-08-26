@@ -364,3 +364,90 @@ class ScannerInstallation(unittest.TestCase):
         script = self._install_script()
         self.assertIn("NOT_VERIFIED", script)
         self.assertNotIn("set -e\n", script)
+
+
+class PullRequestCommitResolution(unittest.TestCase):
+    """The commit under validation on a pull_request event.
+
+    GITHUB_SHA on a pull_request event is the ephemeral MERGE commit GitHub
+    creates to test the merge result. It exists on no branch and no SCM-aware
+    scanner reports it -- SonarQube records the PR HEAD sha. Comparing an
+    analysis revision against GITHUB_SHA therefore mismatched on every pull
+    request, and a current analysis was reported SONARQUBE_RESULT_STALE.
+
+    Evidence: run 32931351490 recorded
+        analysis_revision 7be8685...  (correct, the PR head)
+        scanned_commit    72a034b...  (the merge commit)
+    while an earlier workflow_dispatch run of the same code reported
+    SONARQUBE_SCAN_COMPLETED, because there GITHUB_SHA is the branch head.
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: os.environ.get(k)
+            for k in ("GITHUB_SHA", "GITHUB_EVENT_PATH", "GITHUB_HEAD_REF", "GITHUB_REF_NAME")
+        }
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _event_file(self, payload):
+        import json as _json
+        import tempfile
+
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        )
+        _json.dump(payload, handle)
+        handle.close()
+        self.addCleanup(lambda: os.unlink(handle.name))
+        return handle.name
+
+    def test_pull_request_uses_the_head_sha_not_the_merge_commit(self):
+        from framework.core.context import RunContext
+
+        os.environ["GITHUB_SHA"] = "72a034b54d4cf3371df87edfa71380a8372d6fad"
+        os.environ["GITHUB_EVENT_PATH"] = self._event_file(
+            {"pull_request": {"head": {"sha": "7be8685e4c9b5a1ae9c245e7abb44720715f9113"}}}
+        )
+        context = RunContext.from_environment({})
+        self.assertEqual(context.commit, "7be8685e4c9b5a1ae9c245e7abb44720715f9113")
+        self.assertEqual(context.commit_source, "github.event.pull_request.head.sha")
+
+    def test_push_event_still_uses_github_sha(self):
+        from framework.core.context import RunContext
+
+        os.environ["GITHUB_SHA"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        os.environ["GITHUB_EVENT_PATH"] = self._event_file({"ref": "refs/heads/main"})
+        context = RunContext.from_environment({})
+        self.assertEqual(context.commit, "a" * 40)
+        self.assertEqual(context.commit_source, "GITHUB_SHA")
+
+    def test_missing_event_file_falls_back_to_github_sha(self):
+        from framework.core.context import RunContext
+
+        os.environ["GITHUB_SHA"] = "b" * 40
+        os.environ["GITHUB_EVENT_PATH"] = "/nonexistent/event.json"
+        self.assertEqual(RunContext.from_environment({}).commit, "b" * 40)
+
+    def test_malformed_event_file_falls_back_rather_than_raising(self):
+        from framework.core.context import RunContext
+
+        handle_path = self._event_file({})
+        with open(handle_path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        os.environ["GITHUB_SHA"] = "c" * 40
+        os.environ["GITHUB_EVENT_PATH"] = handle_path
+        self.assertEqual(RunContext.from_environment({}).commit, "c" * 40)
+
+    def test_commit_source_is_reported_in_evidence(self):
+        from framework.core.context import RunContext
+
+        os.environ["GITHUB_SHA"] = "d" * 40
+        self.assertIn("commit_source", RunContext.from_environment({}).to_dict())
