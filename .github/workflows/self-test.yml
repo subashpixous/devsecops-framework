@@ -176,18 +176,275 @@ jobs:
           set -euo pipefail
           # With no external tools present, every external category must be
           # unverified and the verdict must NOT be PASS.
+          # --no-enrichment keeps this test hermetic: a CI job must not fail
+          # because a third-party API was slow, and enrichment availability is
+          # covered by its own unit tests.
           python -m framework.cli run \
             --workspace . \
             --output /tmp/security-results \
-            --environment ci
+            --environment ci \
+            --no-enrichment
           test -f /tmp/security-results/final-report.json
           test -f /tmp/security-results/report.md
           test -f /tmp/security-results/security-report.pdf
+          test -f /tmp/security-results/findings.csv
+          test -f /tmp/security-results/security.sarif
+          test -f /tmp/security-results/evidence-manifest.json
           python - <<'PY'
           import json
           report = json.load(open("/tmp/security-results/final-report.json"))
           status = report["status"]["security"]
           assert status != "PASS", "no scanners installed but SECURITY reported PASS"
           assert report["status"]["coverage_complete"] is False
-          print("OK: JSON, Markdown and PDF produced; SECURITY=%s (correctly not PASS)." % status)
+          print("OK: all five formats produced; SECURITY=%s (correctly not PASS)." % status)
+          PY
+
+      - name: Verify the run proves what it checked
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          report = json.load(open("/tmp/security-results/final-report.json"))
+          manifest = json.load(open("/tmp/security-results/evidence-manifest.json"))
+
+          # 1. Every scanner must appear in the census with a reason, so none can
+          #    vanish silently.
+          coverage = report["file_coverage"]
+          assert coverage.get("per_scanner"), "the census reports no per-scanner coverage"
+          for row in coverage["per_scanner"]:
+              assert row["status"], "scanner %s has no coverage status" % row["tool"]
+              assert row["statement"], "scanner %s has no plain-language statement" % row["tool"]
+              # A scanner with no declared file reach must not report a fabricated
+              # denominator.
+              if not row["file_level"]:
+                  assert row["not_analysed"] == 0, (
+                      "%s declared no file reach but claims %d files missed"
+                      % (row["tool"], row["not_analysed"])
+                  )
+
+          # 2. Enrichment must never silently look like "nothing is exploited".
+          enrichment = report["enrichment"]
+          assert enrichment["epss_status"].startswith("EPSS_")
+          assert enrichment["kev_status"].startswith("KEV_")
+          assert enrichment.get("statement")
+
+          # 3. The evidence manifest must be reproducible and self-limiting.
+          assert manifest["available"], manifest.get("reason")
+          assert manifest["artefacts"], "no artefact digests recorded"
+          assert "NOT signatures" in manifest["integrity_note"], (
+              "the manifest must not imply its digests establish authenticity"
+          )
+          assert manifest["execution"]["scanners_registered"] > 0
+
+          print("OK: %d scanners accounted for, %d artefacts hashed, enrichment state %s/%s."
+                % (len(coverage["per_scanner"]), len(manifest["artefacts"]),
+                   enrichment["epss_status"], enrichment["kev_status"]))
+          PY
+
+      - name: Validate the secure-coding rule pack against its fixtures
+        # This is the ONLY place the framework's own rules are executed by a real
+        # engine. The authoring environment is Windows, where Semgrep does not
+        # run, so rule FIRING cannot be verified there -- only rule SCHEMA can.
+        # Without this gate the pack would ship on the strength of "the YAML
+        # parses", which is not evidence that a single rule matches anything.
+        #
+        # `semgrep --test` reads the `ruleid:` / `ok:` annotations in the fixture
+        # files and fails if a rule misses its vulnerable case OR fires on its
+        # safe case. The second half is the one that keeps the pack usable.
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet semgrep
+          semgrep --version
+
+          echo "--- rule schema (engine-independent) ---"
+          python - <<'PY'
+          from framework.core.rulepack import rule_inventory
+          inv = rule_inventory()
+          assert not inv["invalid_files"], inv["invalid_files"]
+          print("OK: %d rules across %d files, all schema-valid."
+                % (inv["total_rules"], inv["valid_files"]))
+          PY
+
+          echo "--- rule behaviour (fixtures, real engine) ---"
+          semgrep --test --config framework/rules/ framework/rules/
+
+      - name: Verify a security finding does not stop the pipeline
+        # The headline behaviour of v0.6.0, proven on a real runner rather than
+        # asserted in a unit test. A project is built with genuine findings in
+        # it, the CLI is run over it for real, and the exit code is checked.
+        #
+        # The second half matters as much as the first: the run must ALSO have
+        # produced every artefact. An exit code of 0 achieved by skipping the
+        # work would satisfy the first assertion and defeat the entire point.
+        run: |
+          set -euo pipefail
+          workdir=$(mktemp -d)
+          mkdir -p "$workdir/src"
+          cat > "$workdir/src/app.py" <<'SRC'
+          import os
+          import subprocess
+
+
+          def run(cmd):
+              # Deliberately vulnerable fixture: command injection.
+              return subprocess.call(cmd, shell=True)
+
+
+          def read(path):
+              return os.popen("cat " + path).read()
+          SRC
+          printf 'requests==2.6.0\n' > "$workdir/requirements.txt"
+          printf 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY\n' \
+            > "$workdir/.env.example"
+
+          echo "--- running with findings present, no --fail-on ---"
+          set +e
+          python -m framework.cli run \
+            --workspace "$workdir" \
+            --output /tmp/continuation-results \
+            --environment ci \
+            --build-status pass \
+            --test-status pass \
+            --test-coverage-percent 76.5 \
+            --no-enrichment
+          rc=$?
+          set -e
+          echo "exit code: $rc"
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::A run over a project with findings exited $rc. Security findings" \
+                 " must never stop the pipeline; only a framework failure may."
+            exit 1
+          fi
+
+          for artefact in final-report.json normalized-findings.json findings.csv \
+                          security.sarif report.md security-report.pdf evidence-manifest.json; do
+            if [ ! -f "/tmp/continuation-results/$artefact" ]; then
+              echo "::error::$artefact was not produced. Exit code 0 must mean the run" \
+                   " completed, never that it was short-circuited."
+              exit 1
+            fi
+          done
+          echo "OK: the run completed and produced every artefact."
+
+      - name: Verify readiness is honest about what it did not measure
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+
+          report = json.load(open("/tmp/continuation-results/final-report.json"))
+          readiness = report["readiness"]
+          calculation = readiness["calculation"]
+
+          # 1. The pipeline completed and says so.
+          assert report["pipeline"]["status"] == "COMPLETED", report["pipeline"]
+          assert report["pipeline"]["artifacts_written"], "no artefact list recorded"
+
+          # 2. A decision exists, and an unfavourable one is never invented as
+          #    favourable. With no scanners guaranteed on this runner, READY must
+          #    be unreachable.
+          assert readiness["decision"] in (
+              "READY", "CONDITIONALLY_READY", "NOT_READY", "UNKNOWN"
+          ), readiness["decision"]
+          assert readiness["decision_rationale"], "a decision with no stated reason"
+          assert readiness["statement"], "a decision with no plain-language statement"
+
+          # 3. NOT ONE unmeasured dimension may carry a score. This is the
+          #    property that stops "we did not look" reading as "it was fine".
+          for dimension in readiness["dimensions"]:
+              if not dimension["counts_toward_score"]:
+                  assert dimension["score"] is None, (
+                      "%s is %s yet carries a score of %r"
+                      % (dimension["key"], dimension["state"], dimension["score"])
+                  )
+                  assert dimension["earned"] is None, dimension["key"]
+
+          # 4. Both percentages must be recomputable by hand from the published
+          #    table. A number nobody can check is a number nobody should trust.
+          measured = [d for d in readiness["dimensions"] if d["counts_toward_score"]]
+          unknown = [d for d in readiness["dimensions"] if d["counts_toward_unknown"]]
+          earned = sum(d["earned"] for d in measured)
+          weight = sum(d["weight"] for d in measured)
+          unknown_weight = sum(d["weight"] for d in unknown)
+
+          assert abs(round(100.0 * earned / weight, 1) - readiness["readiness_percent"]) < 0.15, (
+              "published readiness %s does not match the dimension table"
+              % readiness["readiness_percent"]
+          )
+          assert abs(
+              round(100.0 * weight / (weight + unknown_weight), 1)
+              - readiness["assurance_percent"]
+          ) < 0.15, "published assurance does not match the dimension table"
+
+          # 5. Assurance must be below 100 here: several categories cannot be
+          #    verified on this runner. If this ever passes, the model has
+          #    started crediting something it did not measure.
+          assert readiness["assurance_percent"] < 100.0, (
+              "assurance is 100%% on a runner where several controls cannot run"
+          )
+          assert readiness["decision"] != "READY", (
+              "READY was reached without full assurance"
+          )
+
+          print("OK: decision=%s readiness=%s%% assurance=%s%% (%d measured, %d unknown, %d n/a)"
+                % (readiness["decision"], readiness["readiness_percent"],
+                   readiness["assurance_percent"], calculation["measured_dimensions"],
+                   calculation["unknown_dimensions"], calculation["excluded_dimensions"]))
+          PY
+
+      - name: Verify the exit code tracks the requested verdict and nothing else
+        run: |
+          set -euo pipefail
+          workdir=$(mktemp -d)
+          printf 'x = 1\n' > "$workdir/app.py"
+
+          check() {
+            local expected="$1" label="$2"
+            shift 2
+            set +e
+            python -m framework.cli run --workspace "$workdir" \
+              --output "/tmp/exit-$label" --environment ci --no-enrichment "$@" >/dev/null 2>&1
+            local rc=$?
+            set -e
+            if [ "$rc" -ne "$expected" ]; then
+              echo "::error::$label expected exit $expected, got $rc"
+              exit 1
+            fi
+            printf '  %-28s -> exit %s\n' "$label" "$rc"
+          }
+
+          # No scanners installed here, so SECURITY is NOT_VERIFIED and the
+          # decision is not READY. Each selector must report its own condition
+          # on its own code, and `never` must report nothing at all.
+          check 0 "default"
+          check 0 "fail-on-never"      --fail-on never
+          check 5 "fail-on-decision"   --fail-on decision
+          check 3 "fail-on-security"   --fail-on security
+          check 3 "legacy-flag"        --fail-on-security
+          check 4 "unknown-stage"      --stage NOT_A_STAGE
+          echo "OK: every exit path reports its own condition."
+
+      - name: Verify a stale SonarQube analysis can never reach PASS
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from framework.collectors.sonarqube import (
+              SONARQUBE_RESULT_STALE, SONARQUBE_SCAN_COMPLETED, evaluate_freshness,
+          )
+          from datetime import datetime, timedelta, timezone
+
+          now = datetime.now(timezone.utc)
+          commit = "a" * 40
+
+          fresh, basis, _ = evaluate_freshness(now, commit, commit, now=now)
+          assert fresh and basis == "revision", "a matching revision must be fresh"
+
+          stale, basis, _ = evaluate_freshness(now, "b" * 40, commit, now=now)
+          assert not stale, "a mismatched revision must be stale however recent"
+
+          old, _, _ = evaluate_freshness(now - timedelta(days=400), "", "", now=now)
+          assert not old, "an aged-out analysis must be stale"
+
+          print("OK: stale SonarQube results cannot be presented as current.")
           PY

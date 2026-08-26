@@ -1,0 +1,466 @@
+# Secure-coding patterns -- PHP
+#
+# ============================================================================
+# WHY THESE PATTERNS LOOK THE WAY THEY DO  (FD-3 root cause)
+# ============================================================================
+# The first version of this file wrote PHP superglobals literally:
+#
+#     - pattern: echo $_GET[...];
+#     - pattern: mysqli_query($CONN, "...$_GET[...]...")
+#
+# Both constructs are wrong, for two separate reasons.
+#
+# 1. `$_GET` IS A VALID SEMGREP METAVARIABLE NAME.
+#    Semgrep metavariables "begin with a $ and can only contain uppercase
+#    characters, _, or digits". `_GET` satisfies that exactly, so Semgrep parses
+#    `$_GET` as a metavariable -- not as the PHP superglobal. In statement
+#    position the pattern fails to compile ("Invalid pattern for PHP"); in
+#    expression position it compiles and is WORSE, because it silently matches
+#    *any* subscripted variable and floods the report with false positives.
+#
+# 2. AN ELLIPSIS INSIDE A STRING LITERAL IS NOT A SUPPORTED CONSTRUCT.
+#    `"...$_GET[...]..."` asks Semgrep to match "any string containing an
+#    interpolated superglobal". There is no such pattern form.
+#
+# THE CORRECT IDIOM, used throughout below: bind the interesting expression to a
+# real metavariable and constrain it with `metavariable-regex`, which matches
+# against the SOURCE TEXT of whatever the metavariable captured. One constraint
+# therefore covers all three shapes that matter:
+#
+#     mysqli_query($c, "SELECT ... $_GET[id]")   interpolated  -> text contains $_GET
+#     mysqli_query($c, $_GET['id'])              direct        -> text contains $_GET
+#     mysqli_query($c, "SELECT ..." . $_GET[1])  concatenated  -> text contains $_GET
+#
+# and leaves the safe forms silent, because their text contains no superglobal.
+#
+# Coverage is preserved, not reduced: every vulnerability class the original file
+# targeted is still targeted, and the HIGH confidence ratings still hold for the
+# same reason as before -- a superglobal in the expression establishes that the
+# value is externally controlled without needing taint analysis.
+#
+# NOT VERIFIED LOCALLY: Semgrep does not run on the authoring platform (Windows,
+# and no PyPI reachability). Compilation and firing are validated by the CI gate
+# `semgrep --test`, which reads the ruleid:/ok: annotations in secure-coding.php.
+# ============================================================================
+
+rules:
+  # ---------------------------------------------------------------- injection
+  - id: devsecops-framework.secure-coding.php.sql-injection-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value reaches a SQL statement. This is SQL injection -- the value
+      is externally controlled by definition, whether it was interpolated,
+      concatenated or passed directly.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-89"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-89. One of the few genuinely HIGH-confidence single-file injection
+        rules available in any language: a superglobal inside the query
+        expression needs no taint analysis to establish the input is untrusted.
+        The metavariable-regex form additionally catches the concatenated and
+        interpolated shapes that a literal pattern cannot express.
+      remediation: >-
+        Use prepared statements with bound parameters (PDO::prepare + execute, or
+        mysqli_prepare + bind_param).
+    # TWO GROUPS, because the shapes need different machinery. CI reported
+    # `missed lines: [19, 27]` -- the interpolated and concatenated cases -- while
+    # the direct-argument case passed. metavariable-regex sees the source text of
+    # a DIRECT binding, but not a superglobal buried inside an interpolated
+    # string or a concatenation. The second group uses Semgrep's deep expression
+    # operator `<... ... >`, which matches a sub-expression anywhere inside the
+    # call, and constrains the VARIABLE rather than the whole argument.
+    pattern-either:
+      # 1. Superglobal passed directly as the query argument.
+      - patterns:
+          - pattern-either:
+              - pattern: mysqli_query($CONN, $QUERY)
+              - pattern: mysqli_query($CONN, $QUERY, ...)
+              - pattern: mysql_query($QUERY)
+              - pattern: mysql_query($QUERY, ...)
+              - pattern: $CONN->query($QUERY)
+              - pattern: $CONN->query($QUERY, ...)
+              - pattern: $PDO->exec($QUERY)
+              - pattern: $CONN->real_query($QUERY)
+          - metavariable-regex:
+              metavariable: $QUERY
+              regex: \$_(GET|POST|REQUEST|COOKIE|FILES)\b
+      # 2. Superglobal interpolated into, or concatenated onto, the query.
+      - patterns:
+          - pattern-either:
+              - pattern: mysqli_query($CONN, <... $REQ[...] ...>)
+              - pattern: mysqli_query($CONN, <... $REQ[...] ...>, ...)
+              - pattern: mysql_query(<... $REQ[...] ...>)
+              - pattern: $CONN->query(<... $REQ[...] ...>)
+              - pattern: $CONN->query(<... $REQ[...] ...>, ...)
+              - pattern: $PDO->exec(<... $REQ[...] ...>)
+              - pattern: $CONN->real_query(<... $REQ[...] ...>)
+          - metavariable-regex:
+              metavariable: $REQ
+              regex: ^\$?_(GET|POST|REQUEST|COOKIE|FILES)$
+
+  - id: devsecops-framework.secure-coding.php.sql-string-concatenation
+    languages: [php]
+    severity: WARNING
+    message: >-
+      A SQL statement is built by concatenation. If any concatenated value comes
+      from a request this is SQL injection.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-89"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-89. Complements the superglobal rule for the common case where the
+        request value was first assigned to a local variable, which single-file
+        analysis cannot trace. WARNING because the concatenated value may be
+        internal.
+      remediation: >-
+        Use prepared statements with bound parameters.
+    pattern-either:
+      - pattern: mysqli_query($CONN, $A . $B)
+      - pattern: mysql_query($A . $B)
+      - pattern: $CONN->query($A . $B)
+      - pattern: $PDO->query($A . $B)
+      - pattern: $PDO->exec($A . $B)
+
+  # ---------------------------------------------------------------------- xss
+  - id: devsecops-framework.secure-coding.php.xss-superglobal-echo
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value is output without escaping. This is reflected XSS -- the
+      attacker controls the value and it is rendered as markup.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-79"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-79. HIGH for the same reason as the SQL rule: the superglobal
+        establishes the input is untrusted. The pattern-not clauses exclude the
+        escaped forms explicitly, so correctly-written output is never flagged --
+        without them the constraint would match `htmlspecialchars($_GET[...])`,
+        whose source text also contains the superglobal.
+      remediation: >-
+        Escape on output with htmlspecialchars($value, ENT_QUOTES, 'UTF-8'), or
+        use a template engine that escapes by default.
+    patterns:
+      - pattern-either:
+          - pattern: echo $OUT;
+          - pattern: echo $OUT, ...;
+          - pattern: print $OUT;
+          - pattern: print_r($OUT);
+          - pattern: var_dump($OUT);
+      - metavariable-regex:
+          metavariable: $OUT
+          regex: \$_(GET|POST|REQUEST|COOKIE)\b
+      # Escaped output is correct output. Excluded explicitly.
+      - pattern-not: echo htmlspecialchars(...);
+      - pattern-not: echo htmlentities(...);
+      - pattern-not: echo strip_tags(...);
+      - pattern-not: echo urlencode(...);
+      - pattern-not: echo rawurlencode(...);
+      - pattern-not: echo intval(...);
+      - pattern-not: echo (int) $X;
+      - pattern-not: print htmlspecialchars(...);
+      - pattern-not: print htmlentities(...);
+
+  # ------------------------------------------------------- command execution
+  - id: devsecops-framework.secure-coding.php.command-execution-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value reaches a command execution function. This is command
+      injection with no further conditions required.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-78"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-78. These functions hand their argument to a shell. With a
+        superglobal anywhere in the argument expression the defect is unambiguous
+        and directly exploitable. escapeshellarg/escapeshellcmd forms are
+        excluded so the mitigated call is not flagged.
+      remediation: >-
+        Avoid shell execution. Where unavoidable, wrap every interpolated
+        component in escapeshellarg and validate against an allow-list.
+    # Same two-group structure as the SQL rule: CI reported `missed lines: [82]`,
+    # the interpolated `system("ping -c 1 $_GET[host]")` case.
+    patterns:
+      - pattern-either:
+          # 1. Superglobal passed directly.
+          - patterns:
+              - pattern-either:
+                  - pattern: system($CMD)
+                  - pattern: system($CMD, ...)
+                  - pattern: exec($CMD)
+                  - pattern: exec($CMD, ...)
+                  - pattern: shell_exec($CMD)
+                  - pattern: passthru($CMD)
+                  - pattern: passthru($CMD, ...)
+                  - pattern: popen($CMD, ...)
+                  - pattern: proc_open($CMD, ...)
+                  - pattern: pcntl_exec($CMD, ...)
+              - metavariable-regex:
+                  metavariable: $CMD
+                  regex: \$_(GET|POST|REQUEST|COOKIE)\b
+          # 2. Superglobal interpolated into the command string.
+          - patterns:
+              - pattern-either:
+                  - pattern: system(<... $REQ[...] ...>)
+                  - pattern: system(<... $REQ[...] ...>, ...)
+                  - pattern: exec(<... $REQ[...] ...>)
+                  - pattern: exec(<... $REQ[...] ...>, ...)
+                  - pattern: shell_exec(<... $REQ[...] ...>)
+                  - pattern: passthru(<... $REQ[...] ...>)
+                  - pattern: popen(<... $REQ[...] ...>, ...)
+                  - pattern: proc_open(<... $REQ[...] ...>, ...)
+                  - pattern: pcntl_exec(<... $REQ[...] ...>, ...)
+              - metavariable-regex:
+                  metavariable: $REQ
+                  regex: ^\$?_(GET|POST|REQUEST|COOKIE)$
+      # Escaped forms are the mitigation and stay silent.
+      - pattern-not: system(escapeshellarg(...))
+      - pattern-not: system(escapeshellcmd(...))
+      - pattern-not: exec(escapeshellarg(...))
+      - pattern-not: exec(escapeshellcmd(...))
+      - pattern-not: shell_exec(escapeshellarg(...))
+      - pattern-not: shell_exec(escapeshellcmd(...))
+
+  # --------------------------------------------------------- file inclusion
+  - id: devsecops-framework.secure-coding.php.file-inclusion-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value is used in include or require. This is local file
+      inclusion, and with allow_url_include enabled it is remote file inclusion
+      -- in either case it leads to code execution.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-98"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-98. PHP-specific and severe: include EXECUTES whatever it loads, so
+        this is arbitrary code execution rather than merely a file-read
+        primitive. Expressed with metavariable-regex because include/require are
+        statements, and the original literal-superglobal statement patterns were
+        the ones that failed to compile.
+      remediation: >-
+        Map the request value onto a fixed allow-list of file paths. Never pass a
+        request value to include or require, even after sanitisation.
+    patterns:
+      - pattern-either:
+          - pattern: include $INC;
+          - pattern: include_once $INC;
+          - pattern: require $INC;
+          - pattern: require_once $INC;
+      - metavariable-regex:
+          metavariable: $INC
+          regex: \$_(GET|POST|REQUEST|COOKIE)\b
+
+  # --------------------------------------------------------- path traversal
+  - id: devsecops-framework.secure-coding.php.path-traversal-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value is used to build a file system path. `../` traversal in the
+      value reaches files outside the intended directory, including configuration
+      files holding database credentials.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-22"
+      owasp: "A01:2021 Broken Access Control"
+      confidence: HIGH
+      rationale: >-
+        CWE-22. In PHP this is frequently the shortest path from an
+        unauthenticated endpoint to database credentials, because configuration
+        files usually sit one directory above the web root. basename() forms are
+        excluded as the common correct mitigation.
+      remediation: >-
+        Resolve with realpath and verify the result is inside the intended
+        directory. Reject traversal rather than stripping it.
+    # Same two-group structure: CI reported `missed lines: [116]`, the
+    # interpolated `file_get_contents("/var/data/$_GET[name]")` case.
+    patterns:
+      - pattern-either:
+          # 1. Superglobal passed directly as the path.
+          - patterns:
+              - pattern-either:
+                  - pattern: file_get_contents($P)
+                  - pattern: file_get_contents($P, ...)
+                  - pattern: file($P)
+                  - pattern: fopen($P, ...)
+                  - pattern: readfile($P)
+                  - pattern: unlink($P)
+                  - pattern: file_put_contents($P, ...)
+                  - pattern: copy($P, ...)
+                  - pattern: rename($P, ...)
+                  - pattern: opendir($P)
+                  - pattern: scandir($P)
+              - metavariable-regex:
+                  metavariable: $P
+                  regex: \$_(GET|POST|REQUEST|COOKIE|FILES)\b
+          # 2. Superglobal interpolated into the path string.
+          - patterns:
+              - pattern-either:
+                  - pattern: file_get_contents(<... $REQ[...] ...>)
+                  - pattern: file_get_contents(<... $REQ[...] ...>, ...)
+                  - pattern: file(<... $REQ[...] ...>)
+                  - pattern: fopen(<... $REQ[...] ...>, ...)
+                  - pattern: readfile(<... $REQ[...] ...>)
+                  - pattern: unlink(<... $REQ[...] ...>)
+                  - pattern: file_put_contents(<... $REQ[...] ...>, ...)
+                  - pattern: copy(<... $REQ[...] ...>, ...)
+                  - pattern: rename(<... $REQ[...] ...>, ...)
+                  - pattern: opendir(<... $REQ[...] ...>)
+                  - pattern: scandir(<... $REQ[...] ...>)
+              - metavariable-regex:
+                  metavariable: $REQ
+                  regex: ^\$?_(GET|POST|REQUEST|COOKIE|FILES)$
+      # basename() is the common correct mitigation and stays silent.
+      - pattern-not: file_get_contents(basename(...))
+      - pattern-not: fopen(basename(...), ...)
+      - pattern-not: readfile(basename(...))
+
+  # -------------------------------------------------- dynamic code execution
+  - id: devsecops-framework.secure-coding.php.dynamic-code-execution
+    languages: [php]
+    severity: ERROR
+    message: >-
+      Dynamic code execution reached by a request value. eval, assert on a
+      string, and create_function all execute their argument as PHP.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-95"
+      owasp: "A03:2021 Injection"
+      confidence: HIGH
+      rationale: >-
+        CWE-95. eval with a superglobal is immediate remote code execution.
+        Expressed with metavariable-regex because `eval` takes a statement-like
+        form whose literal-superglobal pattern failed to compile, and because the
+        interpolated shape cannot be written as a literal pattern at all.
+      remediation: >-
+        Remove eval. Use a dispatch array for behaviour selection and
+        preg_replace_callback instead of the legacy /e modifier.
+    patterns:
+      - pattern-either:
+          - pattern: eval($CODE);
+          - pattern: eval($CODE)
+          - pattern: assert($CODE);
+          - pattern: create_function(..., $CODE)
+      - metavariable-regex:
+          metavariable: $CODE
+          regex: \$_(GET|POST|REQUEST|COOKIE)\b
+
+  # ------------------------------------------------------- deserialization
+  - id: devsecops-framework.secure-coding.php.unserialize-superglobal
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A request value is unserialized. PHP object injection via magic methods
+      such as __wakeup and __destruct can escalate to remote code execution
+      through gadget chains.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-502"
+      owasp: "A08:2021 Software and Data Integrity Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-502. unserialize on untrusted input is unconditionally unsafe in PHP
+        -- exploitability depends only on which classes happen to be loaded. The
+        allowed_classes=false form is excluded as the documented mitigation.
+      remediation: >-
+        Use json_decode for untrusted data. If unserialize is unavoidable, pass
+        `['allowed_classes' => false]`.
+    patterns:
+      - pattern-either:
+          - pattern: unserialize($DATA)
+          - pattern: unserialize($DATA, ...)
+      - metavariable-regex:
+          metavariable: $DATA
+          regex: \$_(GET|POST|REQUEST|COOKIE)\b
+      - pattern-not: unserialize($X, ['allowed_classes' => false])
+
+  # ------------------------------------------------- information disclosure
+  - id: devsecops-framework.secure-coding.php.exception-message-echoed
+    languages: [php]
+    severity: ERROR
+    message: >-
+      An exception message is echoed to the response. PDO and mysqli exception
+      text contains SQL fragments, table names and connection details.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: HIGH
+      rationale: >-
+        CWE-209. Echoing the exception is the standard PHP debugging habit that
+        reaches production; the disclosed SQL fragment is exactly what an
+        attacker needs to refine an injection attempt. error_log forms are not
+        matched, because logging server-side is the correct handling.
+      remediation: >-
+        Log the exception with error_log and display a generic message.
+    pattern-either:
+      - pattern: echo $E->getMessage();
+      - pattern: print $E->getMessage();
+      - pattern: die($E->getMessage());
+      - pattern: exit($E->getMessage());
+      - pattern: echo $E->getTraceAsString();
+      - pattern: printf(..., $E->getMessage(), ...);
+
+  # -------------------------------------------------------------- crypto
+  - id: devsecops-framework.secure-coding.php.weak-password-hash
+    languages: [php]
+    severity: ERROR
+    message: >-
+      A password is hashed with MD5 or SHA-1. Both are fast by design, which
+      makes offline brute force cheap; neither is salted by default.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-916"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-916. Keyed on password-shaped identifiers so md5 over a file checksum
+        is not flagged. PHP has had password_hash built in since 5.5, so there is
+        no remaining justification for md5 on credentials.
+      remediation: >-
+        Use password_hash with PASSWORD_DEFAULT and verify with password_verify.
+    patterns:
+      - pattern-either:
+          - pattern: md5($PWD)
+          - pattern: sha1($PWD)
+          - pattern: hash("md5", $PWD)
+          - pattern: hash("sha1", $PWD)
+      - metavariable-regex:
+          metavariable: $PWD
+          regex: (?i).*(pass|pwd|secret|credential).*
+
+  - id: devsecops-framework.secure-coding.php.tls-verification-disabled
+    languages: [php]
+    severity: ERROR
+    message: >-
+      cURL TLS verification is disabled. The connection is encrypted but
+      unauthenticated and can be transparently intercepted.
+    metadata:
+      category: tls
+      cwe: "CWE-295"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-295. Setting VERIFYPEER false is explicit and has no legitimate
+        production use; it is the standard workaround for a local certificate
+        error that then ships.
+      remediation: >-
+        Remove the override and supply a correct CA bundle via CURLOPT_CAINFO.
+    pattern-either:
+      - pattern: curl_setopt($CH, CURLOPT_SSL_VERIFYPEER, false);
+      - pattern: curl_setopt($CH, CURLOPT_SSL_VERIFYPEER, 0);
+      - pattern: curl_setopt($CH, CURLOPT_SSL_VERIFYHOST, 0);
+      - pattern: curl_setopt($CH, CURLOPT_SSL_VERIFYHOST, false);

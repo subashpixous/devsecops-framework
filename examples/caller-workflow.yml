@@ -34,7 +34,7 @@ jobs:
   security:
     # Pin to a SHA in production. A tag is mutable; a SHA is not, and repinning
     # the previous SHA is the rollback path for a bad framework release.
-    uses: subashpixous/devsecops-framework/.github/workflows/security-pipeline.yml@v0.2.0
+    uses: subashpixous/devsecops-framework/.github/workflows/security-pipeline.yml@v0.6.0
     with:
       environment: production
       stages: PRE_BUILD
@@ -49,8 +49,20 @@ jobs:
       # baseline_path: .security/baseline-findings.json
       # exceptions_path: .security/exceptions.yml
 
-      # Observe, do not block.
-      fail_on_security: false
+      # Report what the caller knows. Neither is inferred, and neither is
+      # assumed to have succeeded when omitted -- an unreported build or test
+      # result becomes a readiness dimension in state NOT_REPORTED, which
+      # scores nothing and lowers the assurance figure.
+      # build_status: ${{ needs.build.result }}
+      # test_status: ${{ needs.test.result }}
+      # test_coverage_percent: "84.2"
+
+      # Observe, do not block. A security finding never fails this job: the run
+      # completes, publishes every finding, computes deployment readiness and
+      # uploads the evidence pack. Gate deployment on `deployment_decision`
+      # below rather than on this job's conclusion -- see the deploy job at the
+      # bottom of this file.
+      fail_on: never
 
       # Set false only where code scanning is unavailable (some private-repo
       # plans, forked-PR events). The SARIF file is written to the artifact
@@ -100,3 +112,39 @@ jobs:
 # Note on `deployment_status`: it is passed so the report can state it, not so
 # it can influence the verdict. A successful deployment never raises the
 # security status, and a failed one never lowers it.
+
+# ---------------------------------------------------------------------------
+# GATING A DEPLOYMENT ON THE SECURITY RESULT
+# ---------------------------------------------------------------------------
+# This is the correct shape, and it is why `fail_on: never` is the default.
+#
+# The security job always succeeds and always publishes. The DEPLOYMENT job is
+# what reads the decision and refuses to run. Failing the security job instead
+# would skip the very steps that publish the findings, upload the evidence and
+# compute the readiness figure -- so the vulnerability that "blocked" the
+# pipeline would end up less visible, not more.
+#
+#   deploy:
+#     needs: security
+#     # READY is the only decision that authorises deployment on its own.
+#     # `deployment_permitted` already encodes the project's policy on whether
+#     # CONDITIONALLY_READY counts, so prefer it over comparing the decision.
+#     if: needs.security.outputs.deployment_permitted == 'true'
+#     runs-on: ubuntu-latest
+#     steps:
+#       - run: ./deploy.sh
+#
+#   record_decision:
+#     needs: security
+#     if: always()
+#     runs-on: ubuntu-latest
+#     steps:
+#       - run: |
+#           echo "decision  : ${{ needs.security.outputs.deployment_decision }}"
+#           echo "readiness : ${{ needs.security.outputs.readiness_percent }}%"
+#           echo "assurance : ${{ needs.security.outputs.readiness_assurance_percent }}%"
+#           echo "critical  : ${{ needs.security.outputs.critical_findings }}"
+#           echo "high      : ${{ needs.security.outputs.high_findings }}"
+#
+# Read `readiness_percent` and `readiness_assurance_percent` together, always.
+# 100% readiness at 20% assurance means one thing was checked and it passed.

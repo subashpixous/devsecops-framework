@@ -16,6 +16,13 @@
 #
 # Scanner availability is never fatal: a tool that fails to install makes its
 # category NOT_VERIFIED. It can never make it PASS.
+#
+# A SECURITY FINDING IS NEVER FATAL EITHER. This job completes, publishes every
+# finding, computes deployment readiness and uploads the evidence pack whatever
+# it discovers. Gate a deployment on the `deployment_decision` /
+# `deployment_permitted` outputs below -- not on this job's conclusion, and not
+# on `security_status`. Killing the pipeline at the first vulnerability only
+# skips the steps that would have published it.
 
 name: Security Pipeline (Reusable)
 
@@ -88,9 +95,27 @@ on:
         description: "Deployment result reported by the caller. Never inferred."
         type: string
         default: ""
+      test_status:
+        description: >-
+          Unit-test result reported by the caller (pass/fail/skipped). Never inferred.
+          Left empty it becomes a readiness dimension in state NOT_REPORTED, which scores
+          nothing and lowers assurance. It is never read as a pass.
+        type: string
+        default: ""
+      test_coverage_percent:
+        description: >-
+          Test-coverage percentage reported by the caller (0-100). Never inferred, never
+          estimated. Anything unparseable is recorded as NOT_REPORTED rather than as zero.
+        type: string
+        default: ""
       active_phase:
+        description: >-
+          Roadmap phase to execute. Categories above this phase report
+          NOT_IMPLEMENTED and their collectors do not run, so this must never sit
+          below the phase declared in framework/policy/default-policy.yml.
+          Asserted by tests/test_release_consistency.py.
         type: number
-        default: 6
+        default: 7
       install_tools:
         description: "Install the external scanners. Disable to use a pre-baked runner image."
         type: boolean
@@ -103,16 +128,38 @@ on:
           unavailable; the SARIF file is written to the artifact either way.
         type: boolean
         default: true
+      fail_on:
+        description: >-
+          Which computed verdict is mirrored into this job's conclusion.
+          `never` (default and recommended): only a framework failure fails the job, so the
+          run always reaches evidence generation, readiness and artifact upload.
+          `evidence`: also fail when the evidence set contradicts itself.
+          `decision`: also fail when the deployment decision is not READY.
+          `security`: also fail when SECURITY is not PASS -- the pre-0.6.0 behaviour.
+          A security FINDING never fails the job under any setting. These select which
+          already-computed verdict the exit status reflects; none of them changes what is
+          scanned, found or reported.
+        type: string
+        default: "never"
       fail_on_security:
-        description: "Fail the job when SECURITY is not PASS. Default false: observe, do not block."
+        description: >-
+          DEPRECATED, retained so existing callers keep working. Equivalent to
+          `fail_on: security`. Prefer gating a deployment job on the `deployment_decision`
+          output instead of failing this one.
         type: boolean
         default: false
       framework_repository:
         type: string
         default: "subashpixous/devsecops-framework"
       framework_ref:
+        description: >-
+          Immutable framework revision (full commit SHA, or a release tag). The
+          default is EMPTY on purpose: `github.job_workflow_sha` normally supplies
+          it, and when that context is unavailable the run must stop rather than
+          quietly resolve to a moving branch. A security verdict produced by an
+          unknown framework revision is not evidence of anything.
         type: string
-        default: "main"
+        default: ""
       artifact_name:
         type: string
         default: "security-results"
@@ -161,6 +208,38 @@ on:
       coverage_complete:
         description: "false whenever any applicable category was not tested."
         value: ${{ jobs.security.outputs.coverage_complete }}
+      pipeline_status:
+        description: "COMPLETED | COMPLETED_WITH_ERRORS | INCOMPLETE -- did the framework finish its own job."
+        value: ${{ jobs.security.outputs.pipeline_status }}
+      evidence_status:
+        description: "COMPLETE | INCOMPLETE | UNTRUSTWORTHY -- can this run's evidence be relied on."
+        value: ${{ jobs.security.outputs.evidence_status }}
+      deployment_decision:
+        description: >-
+          READY | CONDITIONALLY_READY | NOT_READY | UNKNOWN. THIS is what a deployment job
+          should gate on. It is computed from evidence and is independent of this job's
+          conclusion, of the security verdict, and of the CI exit status.
+        value: ${{ jobs.security.outputs.deployment_decision }}
+      deployment_permitted:
+        description: >-
+          true only when the decision and the policy together authorise deployment.
+          CONDITIONALLY_READY does not authorise deployment unless the project's policy
+          explicitly says it does.
+        value: ${{ jobs.security.outputs.deployment_permitted }}
+      readiness_percent:
+        description: "Of the readiness weight that was MEASURED, how much passed."
+        value: ${{ jobs.security.outputs.readiness_percent }}
+      readiness_assurance_percent:
+        description: >-
+          How much of the readiness weight was measured at all. Always read alongside
+          readiness_percent: a high readiness with low assurance means very little was checked.
+        value: ${{ jobs.security.outputs.readiness_assurance_percent }}
+      critical_findings:
+        description: "Open, unsuppressed CRITICAL security findings."
+        value: ${{ jobs.security.outputs.critical_findings }}
+      high_findings:
+        description: "Open, unsuppressed HIGH security findings."
+        value: ${{ jobs.security.outputs.high_findings }}
 
 permissions:
   contents: read
@@ -185,6 +264,14 @@ jobs:
       new_findings: ${{ steps.run.outputs.new_findings }}
       fixed_findings: ${{ steps.run.outputs.fixed_findings }}
       coverage_complete: ${{ steps.run.outputs.coverage_complete }}
+      pipeline_status: ${{ steps.run.outputs.pipeline_status }}
+      evidence_status: ${{ steps.run.outputs.evidence_status }}
+      deployment_decision: ${{ steps.run.outputs.deployment_decision }}
+      deployment_permitted: ${{ steps.run.outputs.deployment_permitted }}
+      readiness_percent: ${{ steps.run.outputs.readiness_percent }}
+      readiness_assurance_percent: ${{ steps.run.outputs.readiness_assurance_percent }}
+      critical_findings: ${{ steps.run.outputs.critical_findings }}
+      high_findings: ${{ steps.run.outputs.high_findings }}
 
     steps:
       # Third-party actions are pinned to immutable full commit SHAs. A tag can be
@@ -197,15 +284,76 @@ jobs:
           fetch-depth: 0          # full history: gitleaks scans past commits
           persist-credentials: false
 
+      - name: Resolve the framework revision (fail closed)
+        id: fwref
+        env:
+          JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
+          IN_FRAMEWORK_REF: ${{ inputs.framework_ref }}
+        run: |
+          set -euo pipefail
+          # Precedence: job_workflow_sha (the commit that defines this reusable
+          # workflow) then an explicit caller-supplied ref. There is deliberately
+          # no third option. The previous default of "main" meant that when the
+          # context was empty the pipeline silently validated the project against
+          # whatever happened to be on the framework's default branch.
+          ref="${JOB_WORKFLOW_SHA:-}"
+          source="github.job_workflow_sha"
+          if [ -z "$ref" ]; then
+            ref="${IN_FRAMEWORK_REF:-}"
+            source="inputs.framework_ref"
+          fi
+
+          if [ -z "$ref" ]; then
+            echo "::error::Framework revision NOT ESTABLISHED. github.job_workflow_sha was empty" \
+                 " and no framework_ref was supplied. Refusing to fall back to a moving branch:" \
+                 " a verdict from an unknown framework revision is not evidence. Pass" \
+                 " framework_ref set to the same immutable SHA or tag used in 'uses:'."
+            exit 1
+          fi
+
+          case "$ref" in
+            main|master|HEAD|refs/heads/*)
+              echo "::error::Framework revision '$ref' is a moving branch. Production runs must" \
+                   " pin an immutable revision (full commit SHA or release tag)."
+              exit 1 ;;
+          esac
+
+          echo "resolved=$ref"    >> "$GITHUB_OUTPUT"
+          echo "source=$source"   >> "$GITHUB_OUTPUT"
+          echo "Framework revision resolved to $ref (from $source)"
+
       - name: Checkout security framework
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           repository: ${{ inputs.framework_repository }}
-          # job_workflow_sha pins the framework to exactly the commit that defines
-          # this reusable workflow, so code and workflow can never drift apart.
-          ref: ${{ github.job_workflow_sha || inputs.framework_ref }}
+          ref: ${{ steps.fwref.outputs.resolved }}
           path: framework
           persist-credentials: false
+
+      - name: Assert the framework revision that is actually checked out
+        working-directory: framework
+        env:
+          EXPECTED: ${{ steps.fwref.outputs.resolved }}
+          REF_SOURCE: ${{ steps.fwref.outputs.source }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "expected : $EXPECTED (from $REF_SOURCE)"
+          echo "actual   : $actual"
+          echo "version  : $(cat VERSION 2>/dev/null || echo NOT_ESTABLISHED)"
+
+          # A tag resolves to a SHA, so compare on the resolvable form rather than
+          # on string equality. What must hold is that HEAD is the revision we
+          # asked for -- not merely that checkout did not error.
+          if [ "$actual" != "$EXPECTED" ]; then
+            resolved="$(git rev-parse "$EXPECTED^{commit}" 2>/dev/null || echo "")"
+            if [ "$resolved" != "$actual" ]; then
+              echo "::error::Framework revision mismatch. Asked for '$EXPECTED', got '$actual'."
+              exit 1
+            fi
+          fi
+          echo "FRAMEWORK_SHA=$actual" >> "$GITHUB_ENV"
+          echo "Framework revision verified."
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
@@ -233,47 +381,147 @@ jobs:
           TRIVY_VERSION: "0.74.0"
           GITLEAKS_VERSION: "8.23.1"
           NUCLEI_VERSION: "3.3.7"
+          COSIGN_VERSION: "2.4.1"
         run: |
           set -uo pipefail
           install_log=/tmp/tool-install.log
           : > "$install_log"
 
+          # Machine-readable install record. The framework ingests this so a
+          # missing scanner is EVIDENCE rather than a line in a log nobody reads.
+          install_record=/tmp/tool-install.json
+          : > "$install_record"
+
           try() {
-            echo "--- installing $1 ---" | tee -a "$install_log"
+            local name="$1"
+            echo "--- installing $name ---" | tee -a "$install_log"
             shift
+            # NOTE: "$@" is invoked in THIS shell, never through `bash -c`.
+            # Shell functions are not exported to child processes, so a helper
+            # called from inside `bash -c` resolves to "command not found"
+            # (exit 127) and every download silently reported FAILED. That was
+            # the defect that left gitleaks, trivy, nuclei and cosign MISSING.
             if "$@" >>"$install_log" 2>&1; then
               echo "    OK"
+              printf '{"tool":"%s","installed":true,"reason":""}\n' "$name" >> "$install_record"
             else
-              echo "    FAILED (category will report NOT_VERIFIED)"
+              local rc=$?
+              echo "    FAILED rc=$rc (category will report NOT_VERIFIED)"
+              printf '{"tool":"%s","installed":false,"reason":"installer exited %d"}\n' \
+                "$name" "$rc" >> "$install_record"
             fi
           }
 
-          try semgrep python -m pip install --quiet semgrep
-          try checkov python -m pip install --quiet checkov
+          # Verify a download against the checksums file published with the same
+          # release, then record the digest we actually got.
+          #
+          # WHAT THIS PROTECTS AGAINST: a truncated, corrupted, or tampered-in-
+          # transit download -- the realistic failure modes for a CI runner
+          # pulling a binary over the public internet. A partial download that
+          # still exits 0 would otherwise install a broken scanner, and a broken
+          # scanner is the exact condition this framework exists to notice.
+          #
+          # WHAT IT DOES NOT PROTECT AGAINST: a compromised upstream release.
+          # The checksums come from the same origin as the artefact, so an
+          # attacker who can replace one can replace the other. Defending
+          # against that needs digests pinned in this file and reviewed on every
+          # bump; it is a deliberate future step, not something this check
+          # silently claims to do.
+          verify_sha256() {
+            local file="$1" expected="$2" name="$3"
+            local actual
+            actual="$(sha256sum "$file" | awk '{print $1}')"
+            echo "    $name sha256=$actual" >>"$install_log"
+            if [ -z "$expected" ]; then
+              echo "    WARNING: no published checksum found for $name; digest recorded only" \
+                | tee -a "$install_log"
+              return 0
+            fi
+            if [ "$actual" != "$expected" ]; then
+              echo "    CHECKSUM MISMATCH for $name (expected $expected, got $actual)" \
+                | tee -a "$install_log"
+              return 1
+            fi
+            echo "    checksum verified for $name" >>"$install_log"
+          }
 
-          try gitleaks bash -c '
-            curl -sSfL -o /tmp/gitleaks.tar.gz \
-              "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" &&
-            tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks'
+          # Look up one artefact's digest in a release checksums file.
+          published_sha() {
+            local url="$1" artefact="$2"
+            curl -sSfL "$url" 2>/dev/null | grep -F " $artefact" | head -1 | awk '{print $1}' || true
+          }
 
-          try trivy bash -c '
-            curl -sSfL -o /tmp/trivy.tar.gz               "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" &&
-            tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy'
+          # One installer function per tool, each executed IN THIS SHELL so it
+          # can see verify_sha256 and published_sha. Every download is still
+          # checksum-verified; nothing here bypasses verification.
+          install_semgrep() { python -m pip install --quiet semgrep; }
+          install_checkov() { python -m pip install --quiet checkov; }
 
-          try nuclei bash -c '
-            curl -sSfL -o /tmp/nuclei.zip \
-              "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" &&
-            unzip -oq /tmp/nuclei.zip -d /usr/local/bin nuclei'
+          install_gitleaks() {
+            local base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+            local artefact="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            curl -sSfL -o /tmp/gitleaks.tar.gz "${base}/${artefact}" || return 1
+            verify_sha256 /tmp/gitleaks.tar.gz \
+              "$(published_sha "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" "$artefact")" \
+              gitleaks || return 1
+            tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+          }
 
-          try cosign bash -c '
-            curl -sSfL -o /usr/local/bin/cosign \
-              "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64" &&
-            chmod +x /usr/local/bin/cosign'
+          install_trivy() {
+            local base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+            local artefact="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+            curl -sSfL -o /tmp/trivy.tar.gz "${base}/${artefact}" || return 1
+            verify_sha256 /tmp/trivy.tar.gz \
+              "$(published_sha "${base}/trivy_${TRIVY_VERSION}_checksums.txt" "$artefact")" \
+              trivy || return 1
+            tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+          }
+
+          install_nuclei() {
+            local base="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}"
+            local artefact="nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
+            curl -sSfL -o /tmp/nuclei.zip "${base}/${artefact}" || return 1
+            verify_sha256 /tmp/nuclei.zip \
+              "$(published_sha "${base}/nuclei_${NUCLEI_VERSION}_checksums.txt" "$artefact")" \
+              nuclei || return 1
+            unzip -oq /tmp/nuclei.zip -d /usr/local/bin nuclei
+          }
+
+          # cosign is pinned to a version rather than "latest": a floating
+          # download makes the evidence manifest record a version nobody chose,
+          # and cosign is the tool that verifies everyone else's signatures.
+          install_cosign() {
+            local base="https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}"
+            curl -sSfL -o /tmp/cosign "${base}/cosign-linux-amd64" || return 1
+            verify_sha256 /tmp/cosign \
+              "$(published_sha "${base}/cosign_checksums.txt" "cosign-linux-amd64")" \
+              cosign || return 1
+            install -m 0755 /tmp/cosign /usr/local/bin/cosign
+          }
+
+          try semgrep  install_semgrep
+          try checkov  install_checkov
+          try gitleaks install_gitleaks
+          try trivy    install_trivy
+          try nuclei   install_nuclei
+          try cosign   install_cosign
 
           echo "=== scanner availability ==="
+          missing=0
           for t in semgrep gitleaks trivy checkov nuclei cosign docker; do
-            printf '  %-10s %s\n' "$t" "$(command -v "$t" >/dev/null && echo AVAILABLE || echo MISSING)"
+            if command -v "$t" >/dev/null; then
+              printf '  %-10s AVAILABLE  %s\n' "$t" "$(command -v "$t")"
+            else
+              printf '  %-10s MISSING\n' "$t"
+              missing=$((missing + 1))
+            fi
           done
+          echo "missing_count=$missing"
+
+          # Deliberately NOT a failure of this step. A missing scanner must reach
+          # the report as NOT_VERIFIED rather than aborting the run -- that is the
+          # fail-closed contract. It is recorded so it cannot pass unnoticed.
+          cp "$install_record" "${GITHUB_WORKSPACE}/tool-install.json" 2>/dev/null || true
 
       - name: Report scanner availability
         working-directory: framework
@@ -309,7 +557,10 @@ jobs:
           IN_POLICY_PATH: ${{ inputs.policy_path }}
           IN_BUILD_STATUS: ${{ inputs.build_status }}
           IN_DEPLOYMENT_STATUS: ${{ inputs.deployment_status }}
+          IN_TEST_STATUS: ${{ inputs.test_status }}
+          IN_TEST_COVERAGE_PERCENT: ${{ inputs.test_coverage_percent }}
           IN_ACTIVE_PHASE: ${{ inputs.active_phase }}
+          IN_FAIL_ON: ${{ inputs.fail_on }}
           IN_FAIL_ON_SECURITY: ${{ inputs.fail_on_security }}
         run: |
           set -euo pipefail
@@ -330,13 +581,21 @@ jobs:
             --sonar-project-key "${IN_SONAR_PROJECT_KEY}"
             --build-status "${IN_BUILD_STATUS}"
             --deployment-status "${IN_DEPLOYMENT_STATUS}"
+            --test-status "${IN_TEST_STATUS}"
+            --test-coverage-percent "${IN_TEST_COVERAGE_PERCENT}"
             --active-phase "${IN_ACTIVE_PHASE}"
           )
           [ -n "${IN_STAGES}" ]          && args+=( --stage "${IN_STAGES}" )
           [ -n "${IN_POLICY_PATH}" ]     && args+=( --policy "${GITHUB_WORKSPACE}/project/${IN_POLICY_PATH}" )
           [ -n "${IN_BASELINE_PATH}" ]   && args+=( --baseline "${GITHUB_WORKSPACE}/project/${IN_BASELINE_PATH}" )
           [ -n "${IN_EXCEPTIONS_PATH}" ] && args+=( --exceptions "${GITHUB_WORKSPACE}/project/${IN_EXCEPTIONS_PATH}" )
-          [ "${IN_FAIL_ON_SECURITY}" = "true" ] && args+=( --fail-on-security )
+          # The deprecated boolean wins when set, so an existing caller keeps the
+          # behaviour it has today. Otherwise the richer selector applies.
+          if [ "${IN_FAIL_ON_SECURITY}" = "true" ]; then
+            args+=( --fail-on security )
+          elif [ -n "${IN_FAIL_ON}" ]; then
+            args+=( --fail-on "${IN_FAIL_ON}" )
+          fi
 
           python -m framework.cli run "${args[@]}"
 

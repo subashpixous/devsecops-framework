@@ -14,6 +14,7 @@ import os
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..core import scanpaths
+from ..core.rulepack import compose_configs, select_rules
 from ..core.registry import ScannerRegistration, register_scanner
 from ..core.toolrunner import accepted, run, tool_available, tool_version
 from .base import Collector, ScannerResult
@@ -101,6 +102,49 @@ def _error_path(err: Any) -> str:
     return ""
 
 
+# A rule that fails to COMPILE is categorically different from a target file
+# that fails to PARSE. The first means a control we shipped never ran; the second
+# means one file was not read. Conflating them lets a broken rule of ours look
+# like a scanned-and-clean result, which is false execution credit -- the exact
+# thing the accounting model below exists to prevent.
+_RULE_ERROR_MARKERS = (
+    "invalid pattern", "invalid rule", "rule parse", "pattern parse",
+    "invalid_pattern", "patternparseerror", "ruleparseerror", "invalid-pattern",
+)
+
+
+def _rule_load_failures(errors: List[Any], known_rule_ids: Sequence[str]) -> Dict[str, str]:
+    """Rule ids the engine refused to load, mapped to the reason it gave.
+
+    Matching is deliberately generous: Semgrep's error shape varies by version
+    and by whether the failure came from the registry or a local file, so any
+    error mentioning one of our rule ids is treated as that rule failing to
+    load. An over-broad match here costs a rule its execution credit, which is
+    the safe direction to be wrong in.
+    """
+    failures: Dict[str, str] = {}
+    for err in errors or ():
+        text = _error_text(err)
+        looks_like_rule_error = any(marker in text for marker in _RULE_ERROR_MARKERS)
+
+        named = ""
+        if isinstance(err, dict):
+            for key in ("rule_id", "ruleId", "rule"):
+                value = err.get(key)
+                if isinstance(value, str) and value:
+                    named = value
+                    break
+
+        for rule_id in known_rule_ids:
+            lowered = rule_id.lower()
+            if named == rule_id or lowered in text:
+                if looks_like_rule_error or named == rule_id:
+                    failures[rule_id] = (
+                        err.get("message") or err.get("long_msg") or err.get("short_msg") or text
+                    ) if isinstance(err, dict) else text
+    return failures
+
+
 def _classify_errors(errors: List[Any]):
     """Split Semgrep errors into blocking failures and named unparsed files.
 
@@ -132,15 +176,42 @@ class SemgrepCollector(Collector):
         binary: Optional[str] = None,
         languages: Optional[Sequence[str]] = None,
         include_dependencies: bool = False,
+        secure_coding_rules: bool = True,
+        replace_default_rules: bool = False,
     ) -> None:
         self.workspace = workspace
         self.languages = list(languages or ())
-        # SEMGREP_RULES lets a project pin its own ruleset without code changes.
-        override = config or os.environ.get("SEMGREP_RULES") or ""
-        self.configs = [c.strip() for c in override.split(",") if c.strip()] or \
-            resolve_configs(self.languages)
+
+        # --- Rule composition -------------------------------------------
+        # ADDITIVE by default. This used to be a replacement: `SEMGREP_RULES`
+        # overwrote the entire configuration, so a project adding one custom
+        # rule silently switched off p/security-audit and p/owasp-top-ten. A
+        # coverage loss disguised as a coverage gain is precisely the failure
+        # this framework exists to make impossible, so the mandatory security
+        # packs can now only be removed by an explicit, recorded opt-out.
+        project_override = config or os.environ.get("SEMGREP_RULES") or ""
+        project_configs = [c.strip() for c in project_override.split(",") if c.strip()]
+        self.replace_default_rules = bool(
+            replace_default_rules
+            or str(os.environ.get("SEMGREP_RULES_REPLACE", "")).strip().lower()
+            in ("1", "true", "yes")
+        )
+
+        base_configs = resolve_configs(self.languages)
+
+        # Framework-owned secure-coding rules, selected by detected language.
+        self.rule_selection = select_rules(
+            self.languages, enabled=bool(secure_coding_rules) and not self.replace_default_rules
+        )
+
+        self.configs, self.composition = compose_configs(
+            base_configs=base_configs,
+            framework_rule_paths=self.rule_selection.config_paths,
+            project_configs=project_configs,
+            replace_defaults=self.replace_default_rules,
+        )
         self.config = ",".join(self.configs)
-        self.config_source = "override" if override else "framework default (security packs)"
+        self.config_source = self.composition["mode"]
         self.timeout = timeout
         self.binary = binary or (TOOL if tool_available(TOOL) else "opengrep")
         # What this scan will and will not read, decided from the languages
@@ -154,6 +225,21 @@ class SemgrepCollector(Collector):
         result.metadata["engine"] = self.binary
         result.metadata["config"] = self.config
         result.metadata["config_source"] = self.config_source
+        # Which rule sources were combined, and whether the mandatory security
+        # packs were in force. A reader must be able to tell a scan that ran the
+        # full set from one that ran a project's narrowed selection.
+        result.metadata["rule_composition"] = self.composition
+        result.metadata["secure_coding_rules"] = self.rule_selection.to_dict()
+        if self.composition.get("warning"):
+            result.warn(self.composition["warning"])
+        for invalid in self.rule_selection.invalid:
+            # A malformed framework rule is our defect, not the project's. It is
+            # excluded from the scan so it cannot fail the whole invocation, and
+            # reported so it cannot pass unnoticed.
+            result.warn(
+                "Framework secure-coding rule file %s was EXCLUDED as invalid (%s). The rules it "
+                "contains did not run." % (invalid.path, invalid.error)
+            )
         result.metadata["languages"] = self.languages
         result.metadata["exclusions"] = self.exclusions.to_dict()
         # Declared reach, consumed by the file-level coverage manifest. Declaring
@@ -204,12 +290,59 @@ class SemgrepCollector(Collector):
 
         errors: List[Any] = payload.get("errors") or []
         blocking, unparsed = _classify_errors(errors)
+
+        # --- Truthful rule accounting (FD-3) -----------------------------
+        # A rule the engine refused to compile did NOT run. Until now the
+        # framework reported every SELECTED rule as executed, so six PHP rules
+        # that failed to load were still credited -- false execution credit for
+        # controls that never looked at a single line. The five figures below are
+        # the honest accounting, and EXECUTED is the only one that may be treated
+        # as coverage.
+        selected_ids = self.rule_selection.rules_executed  # naming is historic: these are SELECTED
+        load_failures = _rule_load_failures(errors, selected_ids)
+        executed_ids = [r for r in selected_ids if r not in load_failures]
+
+        accounting = {
+            "total": self.rule_selection.total_rules,
+            "selected": len(selected_ids),
+            "executed": len(executed_ids),
+            "failed_to_load": len(load_failures),
+            "skipped": len(self.rule_selection.rules_skipped),
+            "failed_to_load_detail": [
+                {"rule": rid, "reason": str(reason)[:400]}
+                for rid, reason in sorted(load_failures.items())
+            ],
+            "executed_rules": executed_ids,
+        }
+        result.metadata["rule_accounting"] = accounting
+
+        if load_failures:
+            # A rule of OURS that does not compile is a framework defect, and it
+            # costs real coverage. partial() keeps the findings that other rules
+            # did produce while denying the category a clean PASS it has not
+            # earned.
+            result.partial(
+                "%d framework secure-coding rule(s) FAILED TO LOAD and therefore did not run: "
+                "%s. The patterns they cover were NOT checked in this scan."
+                % (len(load_failures), ", ".join(sorted(load_failures)))
+            )
         finding_count = len(payload.get("results") or [])
 
         result.metadata["max_target_bytes"] = 2000000
         result.metadata["error_count"] = len(errors)
         result.metadata["blocking_error_count"] = len(blocking)
         result.metadata["unparsed_files"] = sorted(unparsed)
+
+        # Hand the unparsed paths to the file-level census. Without this the
+        # census credited a file the engine explicitly said it could NOT read:
+        # `reads()` decided on completed + extension + exclusions only, so a
+        # parse failure was invisible to it and the published coverage figure
+        # over-claimed. That is the precise failure this framework exists to
+        # prevent; it was found by a consuming pipeline's gate raising a caveat
+        # about a single unparseable source file counted as analysed.
+        declared_coverage = result.metadata.get("coverage")
+        if isinstance(declared_coverage, dict):
+            declared_coverage["unparsed_files"] = sorted(unparsed)
 
         if blocking:
             # A rule failed to run or the engine errored. Coverage is unknown, so
@@ -245,7 +378,9 @@ class SemgrepCollector(Collector):
         return result.succeed().finish()
 
 
-_KW = {"workspace", "config", "timeout", "binary", "languages", "include_dependencies"}
+_KW = {"workspace", "config", "timeout", "binary", "languages", "include_dependencies",
+    "secure_coding_rules", "replace_default_rules",
+}
 
 
 def _build_collector(**kwargs: Any) -> SemgrepCollector:

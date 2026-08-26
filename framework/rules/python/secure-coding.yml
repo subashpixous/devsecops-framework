@@ -1,0 +1,264 @@
+# Secure-coding patterns -- Python (Django / Flask / FastAPI aware)
+#
+# Scope: single-file structural patterns with a framework-shaped destination.
+# These complement rather than duplicate `p/python`: the rules here key on the
+# response boundary and on production configuration, which a language pack does
+# not model.
+
+rules:
+  - id: devsecops-framework.secure-coding.python.exception-message-to-response
+    languages: [python]
+    severity: ERROR
+    message: >-
+      An exception message is returned in an HTTP response. Python exception text
+      routinely contains file paths, SQL fragments and connection details.
+      Return a generic error and log the exception server-side.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: HIGH
+      rationale: >-
+        CWE-209. Requires the exception value to reach a response constructor,
+        so `logger.exception(e)` -- the correct handling -- is not flagged.
+      remediation: >-
+        Return a fixed message plus a correlation id; log str(e) with that id.
+    # PATTERN FORM: these match the response-CONSTRUCTING CALL, not the `return`
+    # statement. Anchoring on `return` missed the most common Flask shape of all
+    # --  `return jsonify({...}), 500` -- because the tuple return is a different
+    # AST node. Matching the call covers the tuple return, the plain return, and
+    # assign-then-return in one, and loses nothing: jsonify/HttpResponse/Response
+    # ARE the response, so a str(exception) inside one is a disclosure wherever
+    # it sits. The sink requirement is what keeps `logger.exception(e)` silent.
+    patterns:
+      - pattern-either:
+          - pattern: jsonify(..., str($EX), ...)
+          - pattern: 'jsonify({..., $K: str($EX), ...})'
+          - pattern: 'JsonResponse({..., $K: str($EX), ...})'
+          - pattern: HttpResponse(str($EX), ...)
+          - pattern: Response(str($EX), ...)
+          - pattern: jsonify(..., f"...{$EX}...", ...)
+          - pattern: 'jsonify({..., $K: f"...{$EX}...", ...})'
+          - pattern: raise HTTPException(..., detail=str($EX), ...)
+          - pattern: 'return {..., $K: str($EX), ...}, $CODE'
+          - pattern: 'return {..., $K: str($EX), ...}'
+      - metavariable-regex:
+          metavariable: $EX
+          regex: (?i)^(e|ex|exc|exception|err|error)$
+
+  - id: devsecops-framework.secure-coding.python.traceback-to-response
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A traceback is returned to the caller. A traceback discloses the full call
+      chain, absolute file paths, library versions and often local variable
+      values -- a complete map of the application's internals.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: HIGH
+      rationale: >-
+        CWE-209. traceback.format_exc() reaching a response is unambiguous;
+        there is no legitimate reason to send it to a client.
+      remediation: >-
+        Log the traceback server-side. Return only a correlation id.
+    # Same reasoning as the rule above: match the response constructor so the
+    # tuple-return form is covered. The response sink is retained deliberately --
+    # `logger.error(traceback.format_exc())` is correct handling and must stay
+    # silent, which a bare `traceback.format_exc()` pattern would break.
+    pattern-either:
+      - pattern: jsonify(..., traceback.format_exc(), ...)
+      - pattern: 'jsonify({..., $K: traceback.format_exc(), ...})'
+      - pattern: 'JsonResponse({..., $K: traceback.format_exc(), ...})'
+      - pattern: HttpResponse(traceback.format_exc(), ...)
+      - pattern: Response(traceback.format_exc(), ...)
+      - pattern: return traceback.format_exc()
+
+  - id: devsecops-framework.secure-coding.python.debug-enabled
+    languages: [python]
+    severity: ERROR
+    message: >-
+      DEBUG mode is enabled. Django's debug page and Flask's debugger expose
+      settings, environment variables and stack traces; Werkzeug's debugger
+      additionally offers an interactive console that is remote code execution
+      by design.
+    metadata:
+      category: misconfiguration
+      cwe: "CWE-489"
+      owasp: "A05:2021 Security Misconfiguration"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-489. Confidence is MEDIUM because a settings file may be
+        development-only; the rule cannot know which settings module ships. It
+        is still worth reporting -- a DEBUG=True that reaches production is
+        among the most damaging single-line defects in Python web development.
+      remediation: >-
+        Drive DEBUG from an environment variable defaulting to False. Never
+        commit DEBUG = True in a module used for deployment.
+    pattern-either:
+      - pattern: DEBUG = True
+      - pattern: $APP.run(..., debug=True, ...)
+      - pattern: $APP.config["DEBUG"] = True
+      - pattern: $APP.debug = True
+
+  - id: devsecops-framework.secure-coding.python.sql-string-formatting
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A SQL statement is built with string formatting or concatenation. The DB-API
+      accepts parameters directly; formatting values into the statement is how
+      SQL injection is introduced.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-89"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-89. Confidence MEDIUM because the interpolated value may be a
+        constant, but parameterisation is correct in every case, so the finding
+        is actionable regardless.
+      remediation: >-
+        Pass parameters as the second argument: `cursor.execute(sql, (value,))`.
+        Note that this is NOT the same as formatting them into `sql`.
+    pattern-either:
+      - pattern: $CUR.execute(f"...{$X}...")
+      - pattern: $CUR.execute("..." % $X)
+      - pattern: $CUR.execute("..." + $X)
+      - pattern: $CUR.execute("...".format(...))
+      - pattern: $CUR.executemany(f"...{$X}...")
+      - pattern: $DB.raw(f"...{$X}...")
+      - pattern: $SESSION.execute(f"...{$X}...")
+
+  - id: devsecops-framework.secure-coding.python.tls-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: >-
+      TLS certificate verification is disabled. The connection is encrypted but
+      unauthenticated, so an active attacker can intercept it transparently.
+    metadata:
+      category: tls
+      cwe: "CWE-295"
+      owasp: "A02:2021 Cryptographic Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-295. `verify=False` is explicit, unambiguous and has no legitimate
+        production use. It is usually added to work around a certificate error
+        during development and then forgotten.
+      remediation: >-
+        Remove verify=False. For an internal CA, pass its bundle via verify or
+        REQUESTS_CA_BUNDLE.
+    pattern-either:
+      - pattern: requests.$METHOD(..., verify=False, ...)
+      - pattern: $SESSION.$METHOD(..., verify=False, ...)
+      - pattern: httpx.$METHOD(..., verify=False, ...)
+      - pattern: ssl._create_unverified_context()
+      - pattern: |
+          $CTX.check_hostname = False
+      - pattern: |
+          $CTX.verify_mode = ssl.CERT_NONE
+
+  - id: devsecops-framework.secure-coding.python.unsafe-deserialization
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Unsafe deserialization. pickle and yaml.load execute arbitrary code during
+      deserialization by design -- on attacker-controlled input this is remote
+      code execution, not a parsing bug.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-502"
+      owasp: "A08:2021 Software and Data Integrity Failures"
+      confidence: HIGH
+      rationale: >-
+        CWE-502. pickle.loads on untrusted data is unconditionally unsafe, and
+        yaml.load without SafeLoader instantiates arbitrary Python objects.
+      remediation: >-
+        Use json for untrusted data; use yaml.safe_load for YAML. Reserve pickle
+        for data you produced and can authenticate.
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: cPickle.loads(...)
+      - pattern: yaml.load($X)
+      - pattern: yaml.load($X, Loader=yaml.Loader)
+      - pattern: yaml.load($X, Loader=yaml.UnsafeLoader)
+      - pattern: dill.loads(...)
+
+  - id: devsecops-framework.secure-coding.python.shell-command-execution
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A shell command is executed with a constructed string. With shell=True the
+      OS shell interprets metacharacters, so any externally influenced component
+      becomes command injection.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-78"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-78. The combination of shell=True and a non-literal command is the
+        canonical injection shape; os.system has no safe form with dynamic input.
+      remediation: >-
+        Pass a list of arguments with shell=False (the default). Never build a
+        shell string from external input.
+    pattern-either:
+      - pattern: os.system(f"...{$X}...")
+      - pattern: os.system($A + $B)
+      - pattern: subprocess.$M(f"...{$X}...", ..., shell=True, ...)
+      - pattern: subprocess.$M($A + $B, ..., shell=True, ...)
+      - pattern: os.popen(f"...{$X}...")
+      - pattern: commands.getoutput($X)
+
+  - id: devsecops-framework.secure-coding.python.dynamic-code-execution
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Dynamic code execution. eval and exec run whatever they are given; on any
+      externally influenced value this is arbitrary code execution.
+    metadata:
+      category: sast_finding
+      cwe: "CWE-95"
+      owasp: "A03:2021 Injection"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-95. Reported on non-literal arguments only. eval on a literal is
+        pointless but harmless; eval on a constructed string is the defect.
+      remediation: >-
+        Use ast.literal_eval for data, or a dispatch dictionary for behaviour.
+        There is almost never a legitimate need for eval on external input.
+    pattern-either:
+      - pattern: eval(f"...{$X}...")
+      - pattern: eval($A + $B)
+      - pattern: exec(f"...{$X}...")
+      - pattern: exec($A + $B)
+
+  - id: devsecops-framework.secure-coding.python.sensitive-value-logged
+    languages: [python]
+    severity: WARNING
+    message: >-
+      A password- or token-shaped value is written to the log. Logs are copied to
+      aggregators, retained far longer than the secret's rotation period, and are
+      readable by staff who were never granted access to the credential itself.
+    metadata:
+      category: sensitive_data_exposure
+      cwe: "CWE-532"
+      owasp: "A09:2021 Security Logging and Monitoring Failures"
+      confidence: MEDIUM
+      rationale: >-
+        CWE-532. Keyed on the identifier name rather than on taint, so it finds
+        the common case (`logger.info(f"password={pwd}")`) while missing values
+        that reach a log through an intermediate variable. Reported at WARNING
+        because a variable named `password_hash` may be safe to log.
+      remediation: >-
+        Never log credential material. Log a stable non-reversible identifier if
+        correlation is needed.
+    patterns:
+      - pattern-either:
+          - pattern: $LOG.$LEVEL(f"...{$SECRET}...")
+          - pattern: $LOG.$LEVEL("..." % $SECRET)
+          - pattern: $LOG.$LEVEL("..." + $SECRET)
+          - pattern: print(f"...{$SECRET}...")
+      - metavariable-regex:
+          metavariable: $SECRET
+          regex: (?i)^(password|passwd|pwd|secret|token|api_key|apikey|access_key|private_key|credential)s?$

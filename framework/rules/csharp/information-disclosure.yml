@@ -1,0 +1,163 @@
+# Information disclosure through exception handling -- C# / ASP.NET
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# `return ex.Message` is the single most common way a .NET application hands an
+# attacker its own internals. A SqlException message carries table and column
+# names; a FileNotFoundException carries absolute server paths; a connection
+# failure carries the database host. None of it is secret to the developer, all
+# of it is reconnaissance to an attacker.
+#
+# Generic security packs under-serve this because the dangerous thing is not the
+# API being called -- `ex.Message` is entirely legitimate in a log statement.
+# The danger is the DESTINATION: a value derived from an exception crossing the
+# boundary into an HTTP response. That is a framework-shaped pattern, which is
+# why it belongs in a framework-owned pack rather than a language pack.
+#
+# PRECISION
+# ---------
+# Every rule here requires BOTH an exception-derived value AND an identified
+# response sink. A rule that fired on `ex.Message` anywhere would flag every
+# correct logging call in the codebase and would be turned off within a week.
+
+rules:
+  - id: devsecops-framework.secure-coding.csharp.exception-message-to-response
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      An exception message is returned directly in an HTTP response. Framework
+      exception text routinely contains database schema, file system paths,
+      connection strings and internal host names. Return a generic message to
+      the caller and log the exception server-side with a correlation id.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: HIGH
+      references:
+        - https://cwe.mitre.org/data/definitions/209.html
+      rationale: >-
+        CWE-209. The exception object is only dangerous when it reaches the
+        client, so the rule requires an exception-derived value inside a
+        response-producing call rather than matching ex.Message on its own --
+        logging it is correct and must not be flagged.
+      remediation: >-
+        Return a generic error and a correlation id. Log the exception with the
+        same id server-side so support can still trace it.
+    patterns:
+      - pattern-either:
+          - pattern: return $RESP(..., $EX.Message, ...);
+          - pattern: return $RESP($EX.Message);
+          - pattern: return $RESP(..., $EX.ToString(), ...);
+          - pattern: return $RESP(..., $EX.StackTrace, ...);
+          - pattern: return $RESP(..., $EX.InnerException.Message, ...);
+          - pattern: |
+              $RESP.WriteAsync($EX.Message);
+          - pattern: |
+              return new $RESULT($EX.Message);
+      - metavariable-regex:
+          metavariable: $EX
+          regex: (?i)^(ex|exc|exception|e|error|err)$
+
+  - id: devsecops-framework.secure-coding.csharp.exception-in-interpolated-response
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      An exception message is interpolated into a string returned to the caller.
+      String interpolation hides the disclosure from a reader scanning for
+      `return ex.Message`, but the exception text reaches the client either way.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: MEDIUM
+      rationale: >-
+        Interpolation is the common way this defect survives review -- the
+        dangerous value is no longer visible at the return statement. Confidence
+        is MEDIUM rather than HIGH because an interpolated string is
+        occasionally built for a log sink on the following line.
+      remediation: >-
+        Build the caller-facing message from constants only. Put the exception
+        text in the log statement instead.
+    patterns:
+      - pattern-either:
+          - pattern: return $"...{$EX.Message}...";
+          - pattern: return $"...{$EX.StackTrace}...";
+          - pattern: return $RESP($"...{$EX.Message}...");
+      - metavariable-regex:
+          metavariable: $EX
+          regex: (?i)^(ex|exc|exception|e|error|err)$
+
+  - id: devsecops-framework.secure-coding.csharp.developer-exception-page-unconditional
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      UseDeveloperExceptionPage() is called without an environment guard. This
+      page renders the full stack trace, source excerpts and request state to
+      anyone who triggers an error, including in production.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-489"
+      owasp: "A05:2021 Security Misconfiguration"
+      confidence: HIGH
+      rationale: >-
+        ASP.NET Core's developer exception page is safe only inside an
+        `if (env.IsDevelopment())` guard. Unconditional registration is a
+        configuration defect with no legitimate production use, which makes this
+        one of the few genuinely high-precision framework rules available.
+      remediation: >-
+        Wrap the call in `if (env.IsDevelopment())` and register
+        UseExceptionHandler for other environments.
+    # NOTE ON PATTERN FORM: the guards below bind a metavariable to the receiver
+    # rather than writing `if (...IsDevelopment())`. An ellipsis used as an
+    # expression PREFIX is a partial expression, which Semgrep rejects -- and it
+    # rejected this rule with PatternParseError, which in turn dropped the rule
+    # from the loaded set and made its fixture annotation unresolvable.
+    patterns:
+      - pattern: $APP.UseDeveloperExceptionPage(...);
+      - pattern-not-inside: |
+          if ($ENV.IsDevelopment()) { ... }
+      - pattern-not-inside: |
+          if ($ENV.IsDevelopment(...)) { ... }
+      - pattern-not-inside: |
+          if ($ENV.IsEnvironment(...)) { ... }
+      - pattern-not-inside: |
+          if ($ENV.EnvironmentName == $NAME) { ... }
+      # The if/else shape is spelled out explicitly rather than excluded with a
+      # bare `if ($COND) { ... } else { ... }`. That catch-all would suppress the
+      # rule inside ANY conditional -- weakening the control to make a fixture
+      # pass, which is not a fix.
+      - pattern-not-inside: |
+          if ($ENV.IsDevelopment()) { ... } else { ... }
+      - pattern-not-inside: |
+          if ($ENV.IsEnvironment(...)) { ... } else { ... }
+
+  - id: devsecops-framework.secure-coding.csharp.database-error-detail-in-response
+    languages: [csharp]
+    severity: ERROR
+    message: >-
+      A database exception detail is returned to the caller. SqlException carries
+      schema names, constraint names and sometimes fragments of the failing
+      statement -- a direct map of the data model for an attacker probing for
+      injection.
+    metadata:
+      category: information_disclosure
+      cwe: "CWE-209"
+      owasp: "A04:2021 Insecure Design"
+      confidence: HIGH
+      rationale: >-
+        Distinguished from the generic exception rule because the disclosure is
+        materially worse: it leaks the database structure specifically, and it
+        is the detail that most often turns a blind injection attempt into a
+        targeted one.
+      remediation: >-
+        Catch database exceptions separately and return a generic failure.
+        Never surface provider-specific detail.
+    patterns:
+      - pattern-either:
+          - pattern: return $RESP(..., $EX.Errors, ...);
+          - pattern: return $RESP(..., $EX.Number, ...);
+          - pattern: return $RESP(..., $EX.Procedure, ...);
+      - metavariable-regex:
+          metavariable: $EX
+          regex: (?i)^(sqlex|sqlexception|dbex|dbexception|ex|e)$

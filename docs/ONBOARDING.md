@@ -82,8 +82,42 @@ specific points in your pipeline, so call the framework again from there:
 
 Each call is independent and none of them changes how you build or deploy.
 
-`build_status` and `deployment_status` are passed so the report can state them.
-They never influence the security verdict.
+`build_status`, `deployment_status`, `test_status` and `test_coverage_percent`
+are passed so the report can state them. They never influence the security
+verdict. They *are* readiness dimensions: an omitted value is `NOT_REPORTED`,
+which scores nothing and lowers the assurance figure. It is never read as a pass.
+
+## Gating deployment
+
+The security job does not fail on findings, and you should not make it. Gate the
+**deployment** job on the decision instead:
+
+```yaml
+jobs:
+  security:
+    uses: <owner>/devsecops-framework/.github/workflows/security-pipeline.yml@<sha>
+    with:
+      fail_on: never          # the default
+
+  deploy:
+    needs: security
+    if: needs.security.outputs.deployment_permitted == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./deploy.sh
+```
+
+Failing the security job instead skips the steps that publish the findings,
+upload the evidence and compute readiness -- so the vulnerability that "blocked"
+your pipeline ends up harder to see, not easier.
+
+Outputs you can read: `deployment_decision`, `deployment_permitted`,
+`readiness_percent`, `readiness_assurance_percent`, `evidence_status`,
+`pipeline_status`, `critical_findings`, `high_findings`, plus everything that
+existed before.
+
+**Read `readiness_percent` and `readiness_assurance_percent` together.** 100%
+readiness at 20% assurance means one thing was checked and it passed.
 
 ## 7. Lifecycle: getting NEW / EXISTING / FIXED
 
@@ -104,7 +138,8 @@ date.** Without one it is treated as expired and does not suppress.
 ## What the framework deliberately does not do
 
 - It does not modify the project's build or deploy workflow.
-- It does not block deployment unless you set `fail_on_security: true`.
+- It does not block deployment. It publishes a decision; your deployment job
+  decides what to do with it.
 - It does not fix findings. Application code is never changed by the framework.
 - It does not guess. Scanners you have not installed, and inputs you have not
   supplied, report `NOT_VERIFIED` with the exact missing requirement named.

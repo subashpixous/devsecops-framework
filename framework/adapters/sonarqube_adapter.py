@@ -143,7 +143,22 @@ class SonarQubeAdapter(Adapter):
 
     def summarize_gate(self, result: ScannerResult) -> Dict[str, Any]:
         payload = result.payload or {}
-        return quality_gate_summary(payload.get("quality_gate"))
+        summary = quality_gate_summary(payload.get("quality_gate"))
+        # The gate says whether the analysis passed. The analysis identity says
+        # whether that verdict describes the code in THIS run. A report showing
+        # one without the other invites the reader to assume the second.
+        summary["analysis_state"] = payload.get("analysis_state", "SONARQUBE_RESULT_UNAVAILABLE")
+        summary["analysis_state_reason"] = payload.get("analysis_state_reason", "")
+        freshness = payload.get("freshness") or {}
+        summary["analysis_date"] = freshness.get("analysis_date", "NOT_ESTABLISHED")
+        summary["analysis_revision"] = freshness.get("analysis_revision", "NOT_ESTABLISHED")
+        summary["scanned_commit"] = freshness.get("scanned_commit", "NOT_ESTABLISHED")
+        summary["freshness_basis"] = freshness.get("basis", "unknown")
+        summary["fresh"] = bool(freshness.get("fresh", False))
+        summary["measures"] = payload.get("measures") or {}
+        summary["project_key"] = payload.get("project_key", "NOT_ESTABLISHED")
+        summary["branch_scope"] = payload.get("branch_scope", "NOT_ESTABLISHED")
+        return summary
 
     def normalize(self, result: ScannerResult, context: RunContext) -> List[Finding]:
         payload = result.payload
