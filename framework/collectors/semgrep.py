@@ -338,7 +338,8 @@ class SemgrepCollector(Collector):
         # `reads()` decided on completed + extension + exclusions only, so a
         # parse failure was invisible to it and the published coverage figure
         # over-claimed. That is the precise failure this framework exists to
-        # prevent, and the TNCWWB gate caught it as a caveat (Core.php).
+        # prevent; it was found by a consuming pipeline's gate raising a caveat
+        # about a single unparseable source file counted as analysed.
         declared_coverage = result.metadata.get("coverage")
         if isinstance(declared_coverage, dict):
             declared_coverage["unparsed_files"] = sorted(unparsed)
