@@ -451,3 +451,118 @@ class PullRequestCommitResolution(unittest.TestCase):
 
         os.environ["GITHUB_SHA"] = "d" * 40
         self.assertIn("commit_source", RunContext.from_environment({}).to_dict())
+
+
+class PipelineContinuesPastFindings(unittest.TestCase):
+    """The v0.6.0 behaviour, asserted where it cannot be quietly undone.
+
+    A future edit that reinstates "any finding fails the job" has to delete one
+    of these tests to do it, which is the point: the reasoning lives here rather
+    than in a commit message nobody reads.
+    """
+
+    def _pipeline(self):
+        return _read(PIPELINE)
+
+    def test_the_reusable_workflow_does_not_fail_on_findings_by_default(self):
+        raw = _workflow_input_default(self._pipeline(), "fail_on") or ""
+        default = raw.strip().strip('"').strip("'")
+        self.assertEqual(
+            default, "never",
+            "fail_on must default to 'never'. Any other default kills the run at the first "
+            "finding, and the stages that get skipped are the ones that publish it.",
+        )
+
+    def test_the_deprecated_boolean_still_defaults_to_false(self):
+        self.assertEqual(
+            _workflow_input_default(self._pipeline(), "fail_on_security"), "false"
+        )
+
+    def test_the_cli_defaults_to_failing_on_nothing(self):
+        from framework.cli import FAIL_ON_NEVER, _build_parser
+        args = _build_parser().parse_args(["run"])
+        self.assertEqual(args.fail_on, FAIL_ON_NEVER)
+        self.assertFalse(args.fail_on_security)
+
+    def test_a_deployment_decision_is_published_as_a_workflow_output(self):
+        """Without this output a consumer has nothing to gate on but the exit code."""
+        text = self._pipeline()
+        for output in ("deployment_decision", "deployment_permitted",
+                       "readiness_percent", "readiness_assurance_percent",
+                       "evidence_status", "pipeline_status"):
+            self.assertIn(
+                "      %s:" % output, text,
+                "workflow_call must expose %r; a caller that cannot read the decision will "
+                "gate on the security status instead, which is the failure mode this "
+                "release exists to remove." % output,
+            )
+
+    def test_the_artifact_upload_still_runs_whatever_happened(self):
+        self.assertIn(
+            "if: always()", self._pipeline(),
+            "the evidence upload must be unconditional -- a blocked run is exactly the run "
+            "whose evidence matters most",
+        )
+
+    def test_no_exit_path_inspects_a_finding_directly(self):
+        """Exit status may only reflect a computed, explained verdict.
+
+        Comments and the docstring are stripped first: the resolver explains in
+        prose that it does not read a severity, and a naive substring check
+        would match the explanation rather than any code.
+        """
+        import ast
+        import inspect
+
+        from framework.cli import _resolve_exit_code
+
+        tree = ast.parse(inspect.getsource(_resolve_exit_code).strip())
+        function = tree.body[0]
+        if (function.body and isinstance(function.body[0], ast.Expr)
+                and isinstance(function.body[0].value, ast.Constant)):
+            function.body.pop(0)  # drop the docstring
+        source = ast.dump(ast.Module(body=function.body, type_ignores=[]))
+
+        for token in ("severity", "CRITICAL", "HIGH", "open_findings"):
+            self.assertNotIn(
+                token, source,
+                "the exit-code resolver reads %r. A finding must reach the exit status only "
+                "through a verdict computed and explained elsewhere." % token,
+            )
+
+
+class ReadinessIsDataDriven(unittest.TestCase):
+    """No readiness figure may come from a number hard-coded in Python."""
+
+    def test_every_weight_and_threshold_comes_from_the_policy_file(self):
+        import yaml
+
+        with open(os.path.join(ROOT, "framework", "policy", "default-policy.yml"),
+                  encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+        readiness = data.get("readiness")
+        self.assertIsInstance(readiness, dict, "default-policy.yml declares no readiness block")
+        for key in ("weights", "risk_points", "risk_points_zero_score",
+                    "ready_threshold_percent", "minimum_assurance_percent",
+                    "unknown_below_assurance_percent",
+                    "conditionally_ready_permits_deployment"):
+            self.assertIn(key, readiness, "readiness.%s must be policy data, not code" % key)
+
+    def test_the_shipped_policy_does_not_let_a_conditional_result_ship_itself(self):
+        from framework.core.policy import Policy
+        self.assertFalse(
+            Policy.load().conditionally_ready_permits_deployment,
+            "CONDITIONALLY_READY must not authorise deployment by default: outstanding "
+            "conditions are accepted by a person, not by a threshold nobody looked at",
+        )
+
+    def test_readiness_dimensions_track_the_category_registry(self):
+        """A new scanner must join readiness without anyone remembering to add it."""
+        from framework.core import readiness as readiness_module
+        source = _read(readiness_module.__file__)
+        for category in CATEGORY_REGISTRY:
+            self.assertNotIn(
+                '"%s"' % category.key, source,
+                "readiness.py names category %r literally. Dimensions must be derived from "
+                "CATEGORY_REGISTRY so the model stays project-adaptive." % category.key,
+            )

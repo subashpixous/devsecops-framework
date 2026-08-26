@@ -51,6 +51,48 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return merged
 
 
+def _numeric_map(value, label, caster):
+    """Coerce a policy mapping of name -> number, refusing anything else.
+
+    A weight that silently became 0 through a typo would drop a whole dimension
+    out of the readiness calculation without saying so, which is precisely the
+    class of silent gap this framework exists to prevent. So it raises.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise PolicyError(
+            "policy key %r must be a mapping, got %r" % (label, type(value).__name__)
+        )
+    out = {}
+    for key, item in value.items():
+        try:
+            out[str(key)] = caster(item)
+        except (TypeError, ValueError) as exc:
+            raise PolicyError("%s.%s must be a number: %r" % (label, key, item)) from exc
+    return out
+
+
+def _positive_int(value, label):
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise PolicyError("%s must be an integer: %r" % (label, value)) from exc
+    if number <= 0:
+        raise PolicyError("%s must be greater than zero: %r" % (label, value))
+    return number
+
+
+def _percent(value, label):
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PolicyError("%s must be a number: %r" % (label, value)) from exc
+    if number < 0 or number > 100:
+        raise PolicyError("%s must be between 0 and 100: %r" % (label, value))
+    return number
+
+
 @dataclass
 class Policy:
     """Resolved policy for one run."""
@@ -65,6 +107,19 @@ class Policy:
     hotspots_count_toward_thresholds: bool = False
     source_paths: List[str] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
+
+    # --- Deployment readiness (data only) ---------------------------------
+    # Held as plain values so a report can print the exact number that produced
+    # each figure. Nothing here branches on a project.
+    readiness_weights: Dict[str, float] = field(default_factory=dict)
+    readiness_risk_points: Dict[str, int] = field(default_factory=dict)
+    readiness_risk_points_zero_score: int = 20
+    readiness_min_test_coverage: float = 0.0
+    readiness_ready_threshold: float = 100.0
+    readiness_min_assurance: float = 100.0
+    readiness_unknown_below_assurance: float = 50.0
+    conditionally_ready_permits_deployment: bool = False
+    readiness_blocking_categories: List[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, override_path: Optional[str] = None, default_path: Optional[str] = None) -> "Policy":
@@ -96,6 +151,29 @@ class Policy:
             except (TypeError, ValueError) as exc:
                 raise PolicyError("Threshold for %s must be an integer: %r" % (level, value)) from exc
 
+        readiness = data.get("readiness") or {}
+        if not isinstance(readiness, dict):
+            raise PolicyError(
+                "policy key 'readiness' must be a mapping, got %r" % type(readiness).__name__
+            )
+
+        weights = _numeric_map(readiness.get("weights"), "readiness.weights", float)
+        # Fail closed on the two keys the scorer cannot proceed without. A
+        # missing weight would otherwise silently resolve to zero, which removes
+        # a dimension from the calculation instead of scoring it.
+        weights.setdefault("default", 2.0)
+        weights.setdefault("required_category", 3.0)
+
+        risk_points = _numeric_map(readiness.get("risk_points"), "readiness.risk_points", int)
+        for level in SEVERITY_ORDER:
+            # An unlisted severity contributes nothing rather than raising: the
+            # canonical scale can gain a level without breaking every policy
+            # file in existence. UNKNOWN is the exception -- it fails closed at
+            # the HIGH weight, because an unclassifiable finding must never be
+            # cheaper than a classified one.
+            if level not in risk_points:
+                risk_points[level] = risk_points.get("HIGH", 5) if level == "UNKNOWN" else 0
+
         policy = cls(
             name=str(data.get("name") or "default"),
             schema_version=int(data.get("schema_version") or 1),
@@ -109,6 +187,33 @@ class Policy:
             hotspots_count_toward_thresholds=bool(data.get("hotspots_count_toward_thresholds", False)),
             source_paths=sources,
             raw=data,
+            readiness_weights=weights,
+            readiness_risk_points=risk_points,
+            readiness_risk_points_zero_score=_positive_int(
+                readiness.get("risk_points_zero_score", 20), "readiness.risk_points_zero_score"
+            ),
+            readiness_min_test_coverage=_percent(
+                readiness.get("min_test_coverage_percent", 0),
+                "readiness.min_test_coverage_percent",
+            ),
+            readiness_ready_threshold=_percent(
+                readiness.get("ready_threshold_percent", 100),
+                "readiness.ready_threshold_percent",
+            ),
+            readiness_min_assurance=_percent(
+                readiness.get("minimum_assurance_percent", 100),
+                "readiness.minimum_assurance_percent",
+            ),
+            readiness_unknown_below_assurance=_percent(
+                readiness.get("unknown_below_assurance_percent", 50),
+                "readiness.unknown_below_assurance_percent",
+            ),
+            conditionally_ready_permits_deployment=bool(
+                readiness.get("conditionally_ready_permits_deployment", False)
+            ),
+            readiness_blocking_categories=[
+                str(item) for item in (readiness.get("blocking_categories") or [])
+            ],
         )
 
         if not policy.required_categories:
@@ -121,6 +226,19 @@ class Policy:
     def is_security_finding_category(self, category: str) -> bool:
         return str(category or "").lower() in self.security_finding_categories
 
+    def readiness_weight(self, key: str, default_key: str = "default") -> float:
+        """Weight for one readiness dimension.
+
+        Resolution order: the dimension's own key, then the named fallback
+        bucket, then `default`. A dimension always resolves to a weight; it is
+        never dropped from the calculation because a policy file omitted it.
+        """
+        if key in self.readiness_weights:
+            return float(self.readiness_weights[key])
+        if default_key in self.readiness_weights:
+            return float(self.readiness_weights[default_key])
+        return float(self.readiness_weights.get("default", 1.0))
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -132,4 +250,17 @@ class Policy:
             "fail_on_quality_gate_error": self.fail_on_quality_gate_error,
             "hotspots_count_toward_thresholds": self.hotspots_count_toward_thresholds,
             "source_paths": self.source_paths,
+            "readiness": {
+                "weights": self.readiness_weights,
+                "risk_points": self.readiness_risk_points,
+                "risk_points_zero_score": self.readiness_risk_points_zero_score,
+                "min_test_coverage_percent": self.readiness_min_test_coverage,
+                "ready_threshold_percent": self.readiness_ready_threshold,
+                "minimum_assurance_percent": self.readiness_min_assurance,
+                "unknown_below_assurance_percent": self.readiness_unknown_below_assurance,
+                "conditionally_ready_permits_deployment": (
+                    self.conditionally_ready_permits_deployment
+                ),
+                "blocking_categories": self.readiness_blocking_categories,
+            },
         }

@@ -43,6 +43,7 @@ def build_report(
     file_coverage: Optional[Dict[str, Any]] = None,
     enrichment: Optional[Dict[str, Any]] = None,
     correlation: Optional[Dict[str, Any]] = None,
+    readiness: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble the complete report document."""
     ordered = sort_findings(findings)
@@ -76,6 +77,36 @@ def build_report(
                 "deployment does not imply a security pass, and a security failure does not imply a "
                 "deployment failure."
             ),
+        },
+        # PIPELINE EXECUTION STATUS. Filled in by the CLI once every artefact
+        # has been attempted, because only then is it known. The placeholder is
+        # deliberately not COMPLETED: a document that never reached the end of
+        # the run must not claim the run reached the end.
+        "pipeline": {
+            "status": "INCOMPLETE",
+            "artifacts_written": [],
+            "errors": [],
+            "statement": (
+                "This report was serialised before the run finished writing its artefacts. "
+                "If this value survives into the published document, the run did not complete."
+            ),
+        },
+        # DEPLOYMENT READINESS. Independent of `status` above: readiness is
+        # computed from what the run established, `status` is the security
+        # verdict, and neither is derived from the other.
+        "readiness": readiness or {
+            "decision": "UNKNOWN",
+            "deployment_permitted": False,
+            "readiness_percent": 0.0,
+            "assurance_percent": 0.0,
+            "evidence_status": "UNTRUSTWORTHY",
+            "statement": (
+                "Deployment readiness was not assessed for this report. UNKNOWN is not a "
+                "pass: it means this document cannot answer whether the commit is deployable."
+            ),
+            "decision_rationale": [],
+            "blockers": [], "conditions": [], "unknowns": [], "strengths": [],
+            "integrity_problems": [], "calculation": {}, "dimensions": [],
         },
         "verdict": {
             "security_status": assessment.security_status,

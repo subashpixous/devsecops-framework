@@ -122,6 +122,8 @@ def _build(
     status = report.get("status") or {}
     gate = report.get("quality_gate") or {}
     coverage = report.get("file_coverage") or {}
+    readiness = report.get("readiness") or {}
+    pipeline = report.get("pipeline") or {}
 
     # Hash every artefact actually on disk, so the manifest describes the files
     # a reader has rather than the files we intended to write.
@@ -236,6 +238,42 @@ def _build(
             "verdict_scope": status.get("verdict_scope", ""),
             "coverage_complete": status.get("coverage_complete", False),
             "open_findings": (report.get("findings") or {}).get("open", 0),
+        },
+
+        # --- THE DEPLOYMENT DECISION ---------------------------------------
+        # Recorded separately from the security verdict because it IS separate:
+        # an auditor asking "was this commit cleared to ship, and on what
+        # basis" must not have to infer the answer from a security status. The
+        # full calculation travels with it, so the percentage can be recomputed
+        # from this record alone rather than taken on trust.
+        "readiness": {
+            "decision": readiness.get("decision", "UNKNOWN"),
+            "deployment_permitted": readiness.get("deployment_permitted", False),
+            "readiness_percent": readiness.get("readiness_percent", "NOT_ESTABLISHED"),
+            "assurance_percent": readiness.get("assurance_percent", "NOT_ESTABLISHED"),
+            "evidence_status": readiness.get("evidence_status", "UNTRUSTWORTHY"),
+            "calculation": readiness.get("calculation", {}),
+            "blockers": readiness.get("blockers", []),
+            "unknowns": readiness.get("unknowns", []),
+            "integrity_problems": readiness.get("integrity_problems", []),
+            "statement": readiness.get("statement", ""),
+            "dimensions": [
+                {
+                    "key": dimension.get("key"),
+                    "state": dimension.get("state"),
+                    "weight": dimension.get("weight"),
+                    "score": dimension.get("score"),
+                    "earned": dimension.get("earned"),
+                }
+                for dimension in (readiness.get("dimensions") or [])
+            ],
+        },
+
+        # --- DID THE FRAMEWORK ITSELF FINISH -------------------------------
+        "pipeline": {
+            "status": pipeline.get("status", "INCOMPLETE"),
+            "artifacts_written": pipeline.get("artifacts_written", []),
+            "errors": pipeline.get("errors", []),
         },
 
         # --- WHAT WAS NOT ESTABLISHED --------------------------------------

@@ -8,6 +8,9 @@
    organisation, or stack. CI asserts this.
 3. It fails safe. Every unknown resolves toward `NOT_VERIFIED`, never toward `PASS`.
 4. It is honest. A category that was not tested says so, in every output format.
+5. It finishes. A security finding is a result to publish, never a reason to stop.
+   The only things that may terminate a run are the framework failing at its own
+   job, and an evidence set that contradicts itself.
 
 ## Pipeline
 
@@ -31,6 +34,8 @@ checkout project             checkout framework @ job_workflow_sha
              normalize -> normalized-findings.json   (common schema)
                     |
               evaluate -> status engine
+                    |
+             readiness -> deployment decision
                     |
                report -> final-report.json
                          report.md
@@ -80,6 +85,95 @@ Two rules are load-bearing:
   produced a finding did not complete, its absence is `UNKNOWN`. A broken
   scanner must never look like remediation.
 
+## Six independent results
+
+The status engine answers "did the security controls pass". That question has one
+honest answer and this framework has always given it. It is the wrong question to
+gate a pipeline on, and gating on it is what this design fixes: a consumer with
+nothing better to key on writes `if SECURITY != PASS: exit 1`, the run dies at
+the first finding, and every stage that would have published that finding is
+skipped. The finding becomes *less* visible, not more.
+
+So there are six results, and none is derived from another:
+
+| Result | Owner | Answers |
+|---|---|---|
+| `PIPELINE` | `cli.py` | Did the framework finish its own job? |
+| `SECURITY` | `core/status_engine.py` | Did the security controls pass? |
+| `EVIDENCE` | `core/readiness.py` | Can this run's evidence be relied on? |
+| `READINESS` | `core/readiness.py` | Of what was measured, how much passed? |
+| `ASSURANCE` | `core/readiness.py` | How much was measured at all? |
+| `DECISION` | `core/readiness.py` | Should this ship? |
+
+`SECURITY` is unchanged and still fail-closed. What changed is that a pipeline
+gates on `DECISION`, published as a workflow output, rather than on the CI exit
+status.
+
+## Readiness scoring
+
+One dimension per **applicable** security category, derived from
+`CATEGORY_REGISTRY` itself so a new scanner joins readiness with no code change,
+plus seven framework-level dimensions: build, unit tests, test coverage, source
+file coverage, scanner execution, evidence integrity, outstanding risk.
+
+```
+readiness = 100 x sum(score x weight for MEASURED dimensions)
+                / sum(weight     for MEASURED dimensions)
+assurance = 100 x sum(weight MEASURED)
+                / (sum(weight MEASURED) + sum(weight UNKNOWN))
+```
+
+| Dimension state | Numerator | Denominator | Assurance denominator |
+|---|---|---|---|
+| `PASS` / `FAILED` / `PARTIAL` | score x weight | weight | weight |
+| `NOT_VERIFIED` / `NOT_TESTED` / `NOT_REPORTED` | -- | -- | weight |
+| `NOT_APPLICABLE` | -- | -- | -- |
+
+The middle row is the load-bearing one. An unmeasured dimension earns nothing
+**and is not dropped**, so no arrangement of untested controls can produce a high
+assurance figure. Dropping them instead -- the obvious implementation -- would
+make a run that checked one thing report 100%, which is exactly the false
+confidence the rest of this framework exists to prevent.
+
+`NOT_APPLICABLE` is the only state that leaves both sums. A project with no
+Dockerfile is neither credited nor penalised for having no container findings.
+
+Scores are never `0.0` for an unmeasured dimension; the field is `None` and
+renders as `--`. "Scored zero" and "never scored" are different facts and no
+output format may render them the same way.
+
+## Decision resolution
+
+Evaluated top to bottom, first match wins. The order encodes what outranks what:
+
+```
+evidence contradicts itself         -> UNKNOWN      (deployment not permitted)
+nothing measured at all             -> UNKNOWN
+assurance < unknown_below_assurance -> UNKNOWN
+any blocking condition              -> NOT_READY
+assurance < minimum_assurance       -> CONDITIONALLY_READY
+readiness < ready_threshold, or any
+  outstanding condition             -> CONDITIONALLY_READY
+otherwise                           -> READY
+```
+
+An untrustworthy evidence set outranks everything because a decision drawn from
+it would be arbitrary. `UNKNOWN` never permits deployment; it is not a pass.
+
+**What blocks:** a failed build, a failed test suite, a failed *required*
+control, an expired suppression, open `CRITICAL` findings over threshold, and a
+self-contradictory evidence set.
+
+**What merely costs:** everything else, including `HIGH` findings. They lower the
+score and appear as outstanding conditions -- visible and expensive, but not a
+termination. Risk is accepted through the exceptions file with an owner and an
+expiry date. There is no other mechanism, and an undated exception suppresses
+nothing.
+
+Weights, risk points and thresholds are data in `framework/policy/default-policy.yml`.
+They are printed in every report next to the figure they produced, so any
+percentage can be recomputed by hand from the published dimension table.
+
 ## Module map
 
 | Module | Responsibility | May not |
@@ -87,6 +181,7 @@ Two rules are load-bearing:
 | `core/schema.py` | The one finding shape every tool normalises into; fingerprinting; severity normalisation | know about any specific tool |
 | `core/categories.py` | The complete security category matrix and applicability rules | know about any specific project |
 | `core/status_engine.py` | The four statuses and the verdict rules | perform I/O |
+| `core/readiness.py` | Readiness dimensions, the two percentages, the deployment decision | change a security verdict, or read a finding except through a policy-defined rule |
 | `core/policy.py` | Threshold and required-control data | contain logic branches per project |
 | `core/registry.py` | Binds tools to categories; the Phase 2–6 extension point | import collectors eagerly |
 | `core/manual_controls.py` | The controls automation cannot cover | ever be marked tested by the framework |
@@ -243,6 +338,7 @@ the workflow definition and the code that runs can never drift apart.
 
 | Layer | Action |
 |---|---|
+| The readiness model | Set `fail_on: security` in the caller. Exit codes 2 and 3 return, and the readiness block is still published alongside them. |
 | A project | Delete its `.github/workflows/security.yml`. Nothing else changes. |
 | A bad framework release | Repin the caller to the previous tag/SHA. |
 | Delivery | Unaffected. The security workflow has no `needs:` relationship with any build or deploy workflow, in either direction. |

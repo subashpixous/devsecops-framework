@@ -16,6 +16,13 @@
 #
 # Scanner availability is never fatal: a tool that fails to install makes its
 # category NOT_VERIFIED. It can never make it PASS.
+#
+# A SECURITY FINDING IS NEVER FATAL EITHER. This job completes, publishes every
+# finding, computes deployment readiness and uploads the evidence pack whatever
+# it discovers. Gate a deployment on the `deployment_decision` /
+# `deployment_permitted` outputs below -- not on this job's conclusion, and not
+# on `security_status`. Killing the pipeline at the first vulnerability only
+# skips the steps that would have published it.
 
 name: Security Pipeline (Reusable)
 
@@ -88,6 +95,19 @@ on:
         description: "Deployment result reported by the caller. Never inferred."
         type: string
         default: ""
+      test_status:
+        description: >-
+          Unit-test result reported by the caller (pass/fail/skipped). Never inferred.
+          Left empty it becomes a readiness dimension in state NOT_REPORTED, which scores
+          nothing and lowers assurance. It is never read as a pass.
+        type: string
+        default: ""
+      test_coverage_percent:
+        description: >-
+          Test-coverage percentage reported by the caller (0-100). Never inferred, never
+          estimated. Anything unparseable is recorded as NOT_REPORTED rather than as zero.
+        type: string
+        default: ""
       active_phase:
         description: >-
           Roadmap phase to execute. Categories above this phase report
@@ -108,8 +128,24 @@ on:
           unavailable; the SARIF file is written to the artifact either way.
         type: boolean
         default: true
+      fail_on:
+        description: >-
+          Which computed verdict is mirrored into this job's conclusion.
+          `never` (default and recommended): only a framework failure fails the job, so the
+          run always reaches evidence generation, readiness and artifact upload.
+          `evidence`: also fail when the evidence set contradicts itself.
+          `decision`: also fail when the deployment decision is not READY.
+          `security`: also fail when SECURITY is not PASS -- the pre-0.6.0 behaviour.
+          A security FINDING never fails the job under any setting. These select which
+          already-computed verdict the exit status reflects; none of them changes what is
+          scanned, found or reported.
+        type: string
+        default: "never"
       fail_on_security:
-        description: "Fail the job when SECURITY is not PASS. Default false: observe, do not block."
+        description: >-
+          DEPRECATED, retained so existing callers keep working. Equivalent to
+          `fail_on: security`. Prefer gating a deployment job on the `deployment_decision`
+          output instead of failing this one.
         type: boolean
         default: false
       framework_repository:
@@ -172,6 +208,38 @@ on:
       coverage_complete:
         description: "false whenever any applicable category was not tested."
         value: ${{ jobs.security.outputs.coverage_complete }}
+      pipeline_status:
+        description: "COMPLETED | COMPLETED_WITH_ERRORS | INCOMPLETE -- did the framework finish its own job."
+        value: ${{ jobs.security.outputs.pipeline_status }}
+      evidence_status:
+        description: "COMPLETE | INCOMPLETE | UNTRUSTWORTHY -- can this run's evidence be relied on."
+        value: ${{ jobs.security.outputs.evidence_status }}
+      deployment_decision:
+        description: >-
+          READY | CONDITIONALLY_READY | NOT_READY | UNKNOWN. THIS is what a deployment job
+          should gate on. It is computed from evidence and is independent of this job's
+          conclusion, of the security verdict, and of the CI exit status.
+        value: ${{ jobs.security.outputs.deployment_decision }}
+      deployment_permitted:
+        description: >-
+          true only when the decision and the policy together authorise deployment.
+          CONDITIONALLY_READY does not authorise deployment unless the project's policy
+          explicitly says it does.
+        value: ${{ jobs.security.outputs.deployment_permitted }}
+      readiness_percent:
+        description: "Of the readiness weight that was MEASURED, how much passed."
+        value: ${{ jobs.security.outputs.readiness_percent }}
+      readiness_assurance_percent:
+        description: >-
+          How much of the readiness weight was measured at all. Always read alongside
+          readiness_percent: a high readiness with low assurance means very little was checked.
+        value: ${{ jobs.security.outputs.readiness_assurance_percent }}
+      critical_findings:
+        description: "Open, unsuppressed CRITICAL security findings."
+        value: ${{ jobs.security.outputs.critical_findings }}
+      high_findings:
+        description: "Open, unsuppressed HIGH security findings."
+        value: ${{ jobs.security.outputs.high_findings }}
 
 permissions:
   contents: read
@@ -196,6 +264,14 @@ jobs:
       new_findings: ${{ steps.run.outputs.new_findings }}
       fixed_findings: ${{ steps.run.outputs.fixed_findings }}
       coverage_complete: ${{ steps.run.outputs.coverage_complete }}
+      pipeline_status: ${{ steps.run.outputs.pipeline_status }}
+      evidence_status: ${{ steps.run.outputs.evidence_status }}
+      deployment_decision: ${{ steps.run.outputs.deployment_decision }}
+      deployment_permitted: ${{ steps.run.outputs.deployment_permitted }}
+      readiness_percent: ${{ steps.run.outputs.readiness_percent }}
+      readiness_assurance_percent: ${{ steps.run.outputs.readiness_assurance_percent }}
+      critical_findings: ${{ steps.run.outputs.critical_findings }}
+      high_findings: ${{ steps.run.outputs.high_findings }}
 
     steps:
       # Third-party actions are pinned to immutable full commit SHAs. A tag can be
@@ -481,7 +557,10 @@ jobs:
           IN_POLICY_PATH: ${{ inputs.policy_path }}
           IN_BUILD_STATUS: ${{ inputs.build_status }}
           IN_DEPLOYMENT_STATUS: ${{ inputs.deployment_status }}
+          IN_TEST_STATUS: ${{ inputs.test_status }}
+          IN_TEST_COVERAGE_PERCENT: ${{ inputs.test_coverage_percent }}
           IN_ACTIVE_PHASE: ${{ inputs.active_phase }}
+          IN_FAIL_ON: ${{ inputs.fail_on }}
           IN_FAIL_ON_SECURITY: ${{ inputs.fail_on_security }}
         run: |
           set -euo pipefail
@@ -502,13 +581,21 @@ jobs:
             --sonar-project-key "${IN_SONAR_PROJECT_KEY}"
             --build-status "${IN_BUILD_STATUS}"
             --deployment-status "${IN_DEPLOYMENT_STATUS}"
+            --test-status "${IN_TEST_STATUS}"
+            --test-coverage-percent "${IN_TEST_COVERAGE_PERCENT}"
             --active-phase "${IN_ACTIVE_PHASE}"
           )
           [ -n "${IN_STAGES}" ]          && args+=( --stage "${IN_STAGES}" )
           [ -n "${IN_POLICY_PATH}" ]     && args+=( --policy "${GITHUB_WORKSPACE}/project/${IN_POLICY_PATH}" )
           [ -n "${IN_BASELINE_PATH}" ]   && args+=( --baseline "${GITHUB_WORKSPACE}/project/${IN_BASELINE_PATH}" )
           [ -n "${IN_EXCEPTIONS_PATH}" ] && args+=( --exceptions "${GITHUB_WORKSPACE}/project/${IN_EXCEPTIONS_PATH}" )
-          [ "${IN_FAIL_ON_SECURITY}" = "true" ] && args+=( --fail-on-security )
+          # The deprecated boolean wins when set, so an existing caller keeps the
+          # behaviour it has today. Otherwise the richer selector applies.
+          if [ "${IN_FAIL_ON_SECURITY}" = "true" ]; then
+            args+=( --fail-on security )
+          elif [ -n "${IN_FAIL_ON}" ]; then
+            args+=( --fail-on "${IN_FAIL_ON}" )
+          fi
 
           python -m framework.cli run "${args[@]}"
 

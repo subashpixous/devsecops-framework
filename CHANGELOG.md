@@ -3,6 +3,141 @@
 All notable changes to this framework are recorded here. Releases are immutable
 tags; callers pin a tag or SHA, and rollback means repinning the previous one.
 
+## [0.6.0] - 2026-08-26
+
+Deployment-readiness release. One behaviour change, stated plainly:
+
+**A security finding no longer stops the pipeline. Nothing is suppressed to
+achieve that.**
+
+### The problem this fixes
+
+The framework has always defaulted to non-blocking, and always emitted exactly
+one security verdict: `PASS` / `FAILED` / `NOT_VERIFIED`. That single conflated
+signal was the only thing a consumer could gate on, so consumers wrote the only
+gate it supports:
+
+```python
+if security_status != "PASS":
+    sys.exit(1)
+```
+
+The pipeline then died at the first finding, and every stage after it was
+skipped -- the remaining scanners, the evidence pack, the consolidated report,
+the artifact upload. **The finding that "blocked" the pipeline ended up less
+visible, not more.** The verdict was correct; keying a pipeline on it was not,
+and the framework offered nothing better.
+
+### Added - deployment readiness and an explicit deployment decision
+
+`framework/core/readiness.py` computes six results that are siblings, none
+derived from another:
+
+| Result | Values |
+|---|---|
+| `PIPELINE` | `COMPLETED` / `COMPLETED_WITH_ERRORS` / `INCOMPLETE` |
+| `SECURITY` | `PASS` / `FAILED` / `NOT_VERIFIED` -- **unchanged** |
+| `EVIDENCE` | `COMPLETE` / `INCOMPLETE` / `UNTRUSTWORTHY` |
+| `READINESS` | percent of measured weight that passed |
+| `ASSURANCE` | percent of total weight that was measured at all |
+| `DECISION` | `READY` / `CONDITIONALLY_READY` / `NOT_READY` / `UNKNOWN` |
+
+Readiness is scored over one dimension per applicable security category --
+derived from the category registry itself, so a new scanner joins readiness with
+no code change and no per-project branching -- plus build, unit tests, test
+coverage, source file coverage, scanner execution, evidence integrity and
+outstanding risk.
+
+### The rule that keeps the number honest
+
+An unmeasured dimension earns nothing **and is not dropped**. It leaves the
+readiness numerator and denominator, and its weight moves to the assurance
+denominator:
+
+```
+readiness = 100 x sum(score x weight for MEASURED dimensions)
+                / sum(weight     for MEASURED dimensions)
+assurance = 100 x sum(weight MEASURED)
+                / (sum(weight MEASURED) + sum(weight UNKNOWN))
+```
+
+A run that measured one dimension and passed it reports `readiness 100% /
+assurance 8%` and can never reach `READY`. There is no arrangement of
+`NOT_TESTED`, `NOT_VERIFIED`, `NOT_REPORTED` or `SCANNER_FAILED` that yields a
+high assurance figure. `NOT_APPLICABLE` is the one state that leaves both sums:
+a project with no Dockerfile is neither credited nor penalised for it.
+
+Every figure is recomputable by hand from the published dimension table. Weights,
+risk points and thresholds are data in `default-policy.yml`, printed in every
+report next to the number they produced. `tests/test_readiness.py` asserts the
+recomputation.
+
+### What blocks, and what merely costs
+
+Only a `CRITICAL` finding over threshold blocks on its own, alongside a failed
+build, a failed test suite, a failed required control, and a self-contradictory
+evidence set. A `HIGH` finding lowers the score and is listed as an outstanding
+condition: visible, costly, and not a termination. Risk is accepted through the
+exceptions file with an owner and an expiry date -- there is no other mechanism,
+and an undated exception still suppresses nothing.
+
+### Added - evidence integrity as a first-class check
+
+The evidence set is now checked for self-consistency, and a contradiction is
+blocking:
+
+* a scanner reporting `OK` while carrying a recorded degradation
+* a category reported `PASS` while a scanner serving it did not complete
+* findings filed under a category with no recorded scanner execution
+
+Any of these forces `EVIDENCE = UNTRUSTWORTHY` and `DECISION = UNKNOWN`. This is
+the one class of failure that is *more* serious than a failed scan: a failed scan
+is a known gap, while a report that contradicts itself makes every other number
+in it unreliable.
+
+### Added - caller-reported test signals
+
+`--test-status` and `--test-coverage-percent`, plumbed through the reusable
+workflow as `test_status` and `test_coverage_percent`. Never inferred. An
+unreported value is `NOT_REPORTED`; an unparseable coverage figure is
+`NOT_REPORTED` rather than zero, because zero scores and unknown must not.
+
+### Added - `--fail-on`, replacing `--fail-on-security`
+
+`never` (default) / `evidence` / `decision` / `security`. New exit codes `5`
+(decision not READY) and `6` (evidence untrustworthy). `--fail-on-security` and
+the `fail_on_security` workflow input still work and still mean exactly what they
+meant; they are deprecated in favour of gating a deployment job on the new
+`deployment_decision` and `deployment_permitted` outputs.
+
+### Added - the consolidated report
+
+`report.md` and the PDF now open with an executive summary and a Deployment
+Readiness Summary written for a reader who reads no other section, followed by
+the full readiness calculation, the deployment decision with its rationale, and a
+remediation plan ordered by urgency rather than by scanner. `final-report.json`
+gains `readiness` and `pipeline` blocks; `evidence-manifest.json` records the
+decision and the complete calculation, so an auditor can recompute the percentage
+from the evidence pack alone.
+
+Report ordering changed so all five formats stay consistent: when the evidence
+manifest fails to assemble, the reports are re-rendered with the corrected
+pipeline status and the manifest is rebuilt over what is actually on disk.
+
+### Unchanged, deliberately
+
+Every existing guarantee. The 20-category registry, the status engine and its
+verdict rules, the four original statuses, `SECURITY = FAILED` and what produces
+it, the fail-closed resolution order, the coverage census and its six buckets,
+the per-scanner census, suppression expiry, `FIXED` requiring a successful
+scanner, the immutable framework SHA assertion, secret stripping, project
+neutrality, and all 444 pre-existing tests -- which still pass, unmodified.
+
+No threshold was lowered, no rule weakened, no finding suppressed, no severity
+downgraded, and no scanner state relabelled. The security verdict this framework
+produces is bit-for-bit the verdict it produced before; what changed is that a
+pipeline no longer has to die to report it.
+
 ## [0.5.0] - 2026-08-24
 
 Production-readiness release. Three defects meant consumers received less than

@@ -42,8 +42,14 @@ class RunContext:
     started_at: str = field(default_factory=utc_now)
 
     # Lifecycle inputs supplied by the caller; never inferred from each other.
+    # The framework does not build, test or deploy, so it cannot observe any of
+    # these. It reports exactly what the caller stated and nothing more: an
+    # absent value stays absent rather than being inferred from a neighbouring
+    # signal that happens to be present.
     build_status_input: str = ""
     deployment_status_input: str = ""
+    test_status_input: str = ""
+    test_coverage_input: str = ""
 
     @staticmethod
     def _pull_request_head_sha() -> str:
@@ -134,6 +140,12 @@ class RunContext:
             "deployed_url": established(self.deployed_url),
             "active_phase": self.active_phase,
             "framework_version": self.framework_version,
+            # Reported verbatim so a reader can see whether a delivery signal
+            # was supplied at all, separately from what it said.
+            "build_status_reported": established(self.build_status_input),
+            "deployment_status_reported": established(self.deployment_status_input),
+            "test_status_reported": established(self.test_status_input),
+            "test_coverage_reported": established(self.test_coverage_input),
             "run_id": established(self.run_id),
             "run_url": established(self.run_url),
             "started_at": self.started_at,

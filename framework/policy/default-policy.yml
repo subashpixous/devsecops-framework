@@ -71,3 +71,88 @@ lifecycle:
   # Findings only count as FIXED when the scanner that produced them ran
   # successfully in this run. A failed scanner must never look like remediation.
   fixed_requires_successful_scanner: true
+
+# --- Deployment readiness -------------------------------------------------
+# Readiness is DATA, not code. Every weight and threshold below is published in
+# the report next to the number it produced, so any figure can be recomputed by
+# hand. Changing a project's risk appetite means overriding these values -- it
+# never means editing framework logic.
+#
+# The scoring rule that makes the figure honest:
+#
+#   readiness = 100 * sum(score*weight for MEASURED dimensions)
+#                   / sum(weight     for MEASURED dimensions)
+#   assurance = 100 * sum(weight MEASURED)
+#                   / (sum(weight MEASURED) + sum(weight UNKNOWN))
+#
+# A dimension that was NOT measured (NOT_VERIFIED / NOT_TESTED / NOT_REPORTED)
+# earns nothing and is NOT dropped: its weight moves to the assurance
+# denominator. There is therefore no arrangement of untested controls that
+# produces a high assurance figure. NOT_APPLICABLE leaves both sums, because a
+# project with no Dockerfile deserves neither credit nor penalty for it.
+readiness:
+  # Relative importance of each dimension. `default` applies to any security
+  # category with no explicit entry; `required_category` applies to categories
+  # named in required_categories above. Per-category overrides use the form
+  # `category:<key>`.
+  weights:
+    default: 2
+    required_category: 3
+    build: 3
+    unit_tests: 3
+    test_coverage: 2
+    code_coverage: 2
+    scanner_execution: 3
+    evidence_integrity: 4
+    finding_risk: 4
+
+  # Severity -> risk points, and the point total at which the outstanding-risk
+  # dimension scores zero. This is what lets readiness distinguish one HIGH
+  # finding from forty, which no category status can express.
+  risk_points:
+    CRITICAL: 10
+    HIGH: 5
+    UNKNOWN: 5
+    MEDIUM: 2
+    LOW: 1
+    INFO: 0
+  risk_points_zero_score: 20
+
+  # Caller-reported test coverage below this scores as PARTIAL rather than PASS.
+  # 0 means the framework states the measured figure without asserting a target:
+  # a universal default minimum would be an invented number, and this framework
+  # does not invent numbers.
+  min_test_coverage_percent: 0
+
+  # READY requires readiness at or above this AND assurance at or above
+  # minimum_assurance_percent AND no outstanding condition. Both default to 100
+  # because a partially validated deployment is CONDITIONALLY_READY at best.
+  ready_threshold_percent: 100
+  minimum_assurance_percent: 100
+
+  # Below this much assurance the decision is UNKNOWN rather than
+  # CONDITIONALLY_READY: too little of the picture was established for the
+  # readiness figure to carry meaning. This is a policy position, not a fact
+  # about the world, which is why it is stated here and printed in every report.
+  unknown_below_assurance_percent: 50
+
+  # Whether CONDITIONALLY_READY authorises deployment on its own. False by
+  # default: outstanding conditions are accepted by a person through the
+  # exceptions file, not by a threshold nobody looked at.
+  conditionally_ready_permits_deployment: false
+
+  # Categories whose FAILED status blocks deployment, in addition to
+  # required_categories, which always block. A finding on its own lowers
+  # readiness and appears as a condition; only CRITICAL severity blocks by
+  # severity alone (see severity_thresholds.CRITICAL above).
+  #
+  # finding_lifecycle is listed because the only thing that makes it FAILED is
+  # an EXPIRED or undated suppression. That is not a finding -- it is accepted
+  # risk that has quietly stopped being reviewed, and the findings it used to
+  # cover are live again. A governance control that has lapsed is exactly the
+  # condition somebody must look at before shipping.
+  #
+  # Note this cannot fire merely because no baseline was supplied: that state is
+  # NOT_VERIFIED, which is an unknown and lowers assurance rather than blocking.
+  blocking_categories:
+    - finding_lifecycle

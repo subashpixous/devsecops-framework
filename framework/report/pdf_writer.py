@@ -57,7 +57,32 @@ STATUS_COLOURS = {
     "ERROR": ("#B71C1C", "#FFEBEE"),
     "OK": ("#1B5E20", "#E8F5E9"),
     "PARTIAL": ("#E65100", "#FFF3E0"),
+    # Readiness vocabulary. CONDITIONALLY_READY is deliberately amber rather
+    # than green: it is not a pass, and a reader skimming for colour must not
+    # be able to mistake it for one.
+    "READY": ("#1B5E20", "#E8F5E9"),
+    "CONDITIONALLY_READY": ("#E65100", "#FFF3E0"),
+    "NOT_READY": ("#B71C1C", "#FFEBEE"),
+    "NOT_REPORTED": ("#37474F", "#ECEFF1"),
+    "COMPLETED": ("#1B5E20", "#E8F5E9"),
+    "COMPLETED_WITH_ERRORS": ("#E65100", "#FFF3E0"),
+    "INCOMPLETE": ("#E65100", "#FFF3E0"),
+    "COMPLETE": ("#1B5E20", "#E8F5E9"),
+    "UNTRUSTWORTHY": ("#B71C1C", "#FFEBEE"),
 }
+
+# Severity -> remediation tier, matching report.md exactly. The two renderings
+# come from the same report document and must never order the work differently.
+REMEDIATION_TIERS = (
+    ("CRITICAL", "Immediate", "Remediate before this commit is deployed anywhere."),
+    ("HIGH", "High priority", "Remediate in this iteration."),
+    ("UNKNOWN", "High priority",
+     "Classify first. An unclassifiable finding is treated as HIGH here precisely because "
+     "nobody has yet established that it is not."),
+    ("MEDIUM", "Medium priority", "Schedule into the next planned iteration."),
+    ("LOW", "Long-term hardening", "Fold into routine maintenance."),
+    ("INFO", "Long-term hardening", "Informational; act on it where it is cheap to do so."),
+)
 
 SEVERITY_COLOURS = {
     "CRITICAL": "#B71C1C",
@@ -251,6 +276,8 @@ def build_pdf(
     verdict = report["verdict"]
     findings = report["findings"]
     gate = report.get("quality_gate") or {}
+    readiness = report.get("readiness") or {}
+    pipeline = report.get("pipeline") or {}
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     doc = SimpleDocTemplate(
@@ -274,7 +301,7 @@ def build_pdf(
     story: List[Any] = []
 
     # --- Cover ---------------------------------------------------------------
-    story.append(Paragraph("Application Security Report", styles.title))
+    story.append(Paragraph("Application Security &amp; Deployment Readiness Report", styles.title))
     story.append(
         Paragraph(
             "%s &mdash; version %s &mdash; Phase %s &mdash; generated %s"
@@ -290,6 +317,12 @@ def build_pdf(
     story.append(Spacer(1, 5 * mm))
     story.append(HRFlowable(width="100%", thickness=1.2, color=colors.HexColor("#1B263B")))
     story.append(Spacer(1, 6 * mm))
+
+    # --- Executive summary ---------------------------------------------------
+    # First page, above everything else. A reader who stops here must still
+    # leave with the decision, the two percentages that qualify it, and the
+    # finding counts -- never with one of those without the others.
+    _executive_summary(story, styles, report, readiness, pipeline, status, findings)
 
     # --- Panel 1: deployment result ------------------------------------------
     story.append(
@@ -826,8 +859,286 @@ def build_pdf(
         )
     )
 
+    _readiness_pages(story, styles, readiness)
+    _remediation_pages(story, styles, findings)
+
     doc.build(story, onFirstPage=_page_furniture, onLaterPages=_page_furniture)
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Readiness rendering
+# ---------------------------------------------------------------------------
+
+
+def _executive_summary(story, styles, report, readiness, pipeline, status, findings) -> None:
+    project = report["project"]
+    severities = findings.get("security_severity_breakdown") or {}
+
+    story.append(Paragraph("Executive summary", styles.h1))
+    story.append(
+        _kv_table(
+            [
+                ("Project", project["project_name"]),
+                ("Branch", project["branch"]),
+                ("Commit", project["commit"]),
+                ("Environment", project["environment"]),
+                ("Framework version", report["framework"]["version"]),
+                ("Pipeline run", project["run_url"]),
+            ],
+            styles,
+        )
+    )
+    story.append(Spacer(1, 4 * mm))
+    story.append(
+        _status_panel(
+            "DEPLOYMENT DECISION &nbsp;&mdash;&nbsp; COMPUTED FROM THIS RUN&rsquo;S EVIDENCE",
+            [
+                ("PIPELINE", pipeline.get("status", "INCOMPLETE")),
+                ("SECURITY", status["security"]),
+                ("EVIDENCE", readiness.get("evidence_status", "UNTRUSTWORTHY")),
+                ("DECISION", readiness.get("decision", "UNKNOWN")),
+            ],
+            styles,
+        )
+    )
+    story.append(Spacer(1, 4 * mm))
+    story.append(
+        _kv_table(
+            [
+                ("Deployment readiness",
+                 "%s%%  (of what was measured, how much passed)"
+                 % readiness.get("readiness_percent", 0.0)),
+                ("Assurance",
+                 "%s%%  (how much of the picture was measured at all)"
+                 % readiness.get("assurance_percent", 0.0)),
+                ("Deployment permitted by this run",
+                 "YES" if readiness.get("deployment_permitted") else "NO"),
+            ],
+            styles,
+        )
+    )
+    story.append(Spacer(1, 3 * mm))
+    story.append(Paragraph("<b>%s</b>" % _text(readiness.get("statement", "")), styles.body))
+    story.append(Spacer(1, 3 * mm))
+    story.append(
+        Paragraph(
+            "Open security findings: <b>%d CRITICAL, %d HIGH, %d MEDIUM, %d LOW, %d UNKNOWN</b>. "
+            "Every one is listed in this report. A finding does not stop the pipeline, and no "
+            "finding is removed, downgraded or suppressed in order to let it continue."
+            % (severities.get("CRITICAL", 0), severities.get("HIGH", 0),
+               severities.get("MEDIUM", 0), severities.get("LOW", 0),
+               severities.get("UNKNOWN", 0)),
+            styles.body,
+        )
+    )
+    story.append(Spacer(1, 3 * mm))
+
+    blockers = readiness.get("blockers") or []
+    if blockers:
+        story.append(Paragraph("Blockers", styles.h2))
+        for index, blocker in enumerate(blockers, 1):
+            story.append(
+                Paragraph(
+                    "%d. <b>%s</b> &mdash; %s"
+                    % (index, _text(blocker["title"]), _text(blocker["reason"], 400)),
+                    styles.warn,
+                )
+            )
+        story.append(Spacer(1, 3 * mm))
+
+    unknowns = readiness.get("unknowns") or []
+    if unknowns:
+        story.append(Paragraph("Not established &mdash; these are NOT passes", styles.h2))
+        story.append(
+            _data_table(
+                ["Dimension", "State"],
+                [[u["title"], u["state"]] for u in unknowns],
+                [110 * mm, 60 * mm],
+                styles,
+            )
+        )
+        story.append(Spacer(1, 3 * mm))
+
+    story.append(Spacer(1, 3 * mm))
+    story.append(HRFlowable(width="100%", thickness=1.2, color=colors.HexColor("#1B263B")))
+    story.append(Spacer(1, 5 * mm))
+
+
+def _readiness_pages(story, styles, readiness) -> None:
+    dimensions = readiness.get("dimensions") or []
+    calculation = readiness.get("calculation") or {}
+
+    story.append(PageBreak())
+    story.append(Paragraph("15. Deployment readiness", styles.h1))
+    if not dimensions:
+        story.append(Paragraph(_text(readiness.get("statement", "")), styles.warn))
+        return
+
+    story.append(
+        Paragraph(
+            "<b>Readiness %s%% &mdash; assurance %s%%.</b> The two are always reported together: "
+            "a high readiness figure from a run that measured very little is true and completely "
+            "misleading on its own."
+            % (readiness.get("readiness_percent", 0.0), readiness.get("assurance_percent", 0.0)),
+            styles.body,
+        )
+    )
+    story.append(Spacer(1, 3 * mm))
+
+    story.append(Paragraph("15.1 How these numbers were calculated", styles.h2))
+    story.append(Paragraph(_text("readiness = " + calculation.get("formula_readiness", "")), styles.mono))
+    story.append(Paragraph(_text("assurance = " + calculation.get("formula_assurance", "")), styles.mono))
+    story.append(Spacer(1, 3 * mm))
+    story.append(
+        _kv_table(
+            [
+                ("Dimensions measured", calculation.get("measured_dimensions", 0)),
+                ("Dimensions NOT established", calculation.get("unknown_dimensions", 0)),
+                ("Dimensions not applicable", calculation.get("excluded_dimensions", 0)),
+                ("Weight measured", calculation.get("measured_weight", 0)),
+                ("Weight earned", calculation.get("earned_weight", 0)),
+                ("Weight unknown", calculation.get("unknown_weight", 0)),
+                ("Readiness", "%s%%" % calculation.get("readiness_percent", 0.0)),
+                ("Assurance", "%s%%" % calculation.get("assurance_percent", 0.0)),
+            ],
+            styles,
+        )
+    )
+    story.append(Spacer(1, 2 * mm))
+    story.append(Paragraph(_text(calculation.get("note", "")), styles.note))
+    story.append(Spacer(1, 4 * mm))
+
+    story.append(Paragraph("15.2 Every dimension", styles.h2))
+    rows = []
+    for dimension in dimensions:
+        if dimension["counts_toward_score"]:
+            counts = "score"
+        elif dimension["counts_toward_unknown"]:
+            counts = "unknown"
+        else:
+            counts = "excluded"
+        rows.append([
+            dimension["title"],
+            dimension["family"],
+            dimension["state"],
+            dimension["weight"],
+            "--" if dimension["score"] is None else round(dimension["score"], 3),
+            "--" if dimension["earned"] is None else dimension["earned"],
+            counts,
+        ])
+    story.append(
+        _data_table(
+            ["Dimension", "Family", "State", "Wt", "Score", "Earned", "Counts"],
+            rows,
+            [46 * mm, 30 * mm, 26 * mm, 10 * mm, 15 * mm, 16 * mm, 18 * mm],
+            styles,
+        )
+    )
+    story.append(Spacer(1, 2 * mm))
+    story.append(
+        Paragraph(
+            "A dash in the Score column means the dimension was never measured. That is a "
+            "different fact from a score of zero, and this table never renders them the same way.",
+            styles.note,
+        )
+    )
+    story.append(Spacer(1, 4 * mm))
+
+    for title, key, style_name in (
+        ("15.3 Strengths", "strengths", "body"),
+        ("15.4 Outstanding conditions", "conditions", "body"),
+        ("15.5 Blockers", "blockers", "warn"),
+    ):
+        story.append(Paragraph(title, styles.h2))
+        entries = readiness.get(key) or []
+        if not entries:
+            story.append(Paragraph("None.", styles.body))
+        for entry in entries:
+            if isinstance(entry, str):
+                story.append(Paragraph("&bull; %s" % _text(entry, 400), getattr(styles, style_name)))
+            else:
+                story.append(
+                    Paragraph(
+                        "&bull; <b>%s</b>: %s"
+                        % (_text(entry.get("title", "")),
+                           _text(entry.get("reason") or entry.get("detail") or "", 400)),
+                        getattr(styles, style_name),
+                    )
+                )
+        story.append(Spacer(1, 3 * mm))
+
+    story.append(Paragraph("16. Deployment decision", styles.h1))
+    story.append(
+        _status_panel(
+            "DEPLOYMENT DECISION",
+            [
+                ("DECISION", readiness.get("decision", "UNKNOWN")),
+                ("PERMITTED", "YES" if readiness.get("deployment_permitted") else "NO"),
+            ],
+            styles,
+        )
+    )
+    story.append(Spacer(1, 4 * mm))
+    story.append(Paragraph("Why:", styles.h2))
+    for reason in readiness.get("decision_rationale") or []:
+        story.append(Paragraph("&bull; %s" % _text(reason, 500), styles.body))
+    story.append(Spacer(1, 3 * mm))
+    story.append(Paragraph(_text(readiness.get("independence_note", "")), styles.note))
+
+
+def _remediation_pages(story, styles, findings) -> None:
+    """Findings reordered by what to do about them, not by which tool found them."""
+    open_statuses = ("OPEN", "CONFIRMED", "REOPENED", "TO_REVIEW")
+    items = [f for f in (findings.get("items") or []) if f.get("status") in open_statuses]
+
+    story.append(PageBreak())
+    story.append(Paragraph("17. Remediation plan", styles.h1))
+    if not items:
+        story.append(
+            Paragraph(
+                "No open finding requires remediation in this run. This is a statement about what "
+                "was looked for and found; consult the coverage census and the manual control "
+                "list for what was not looked for at all.",
+                styles.body,
+            )
+        )
+        return
+
+    by_severity = {}
+    for finding in items:
+        by_severity.setdefault(finding.get("severity", "UNKNOWN"), []).append(finding)
+
+    for severity, tier, guidance in REMEDIATION_TIERS:
+        bucket = by_severity.get(severity) or []
+        if not bucket:
+            continue
+        story.append(Paragraph("%s &mdash; %d %s finding(s)" % (tier, len(bucket), severity), styles.h2))
+        story.append(Paragraph(_text(guidance), styles.note))
+        grouped = {}
+        for finding in bucket:
+            key = _text(
+                finding.get("remediation")
+                or "No remediation guidance was supplied by the scanner that reported this.",
+                220,
+            )
+            grouped.setdefault(key, []).append(finding)
+        rows = []
+        for action, group in sorted(grouped.items(), key=lambda kv: -len(kv[1])):
+            files = sorted({f.get("file") or f.get("endpoint") or "n/a" for f in group})
+            where = ", ".join(files[:3])
+            if len(files) > 3:
+                where += " and %d more" % (len(files) - 3)
+            rows.append([action, len(group), where, ", ".join(sorted({f.get("tool", "") for f in group}))])
+        story.append(
+            _data_table(
+                ["Action", "#", "Where", "Reported by"],
+                rows,
+                [78 * mm, 10 * mm, 50 * mm, 32 * mm],
+                styles,
+            )
+        )
+        story.append(Spacer(1, 3 * mm))
 
 
 def write_pdf(

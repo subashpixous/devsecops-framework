@@ -1,8 +1,20 @@
 """report.md -- human-readable rendering of final-report.json.
 
-Presentation rule enforced here: the deployment result and the security result
-are rendered as two separate, visually distinct blocks. Nothing in this file may
-combine them into a single "overall" verdict.
+One document, six audiences. A CTO reads the first two sections and stops; a
+developer reads the findings; an auditor reads the evidence. So the management
+view comes FIRST and is self-contained, and the detail that substantiates it
+follows in numbered sections that the summary points at.
+
+Presentation rules enforced here, in order of how easily they are violated:
+
+1. The deployment result and the security result are two separate, visually
+   distinct blocks. Nothing in this file may combine them into a single
+   "overall" verdict.
+2. A readiness percentage never appears without the assurance percentage beside
+   it. On its own, "readiness 100%" from a run that measured one dimension is
+   true and completely misleading.
+3. Nothing here recomputes or reinterprets a status. This module renders; it
+   does not decide.
 """
 
 from __future__ import annotations
@@ -24,7 +36,30 @@ STATUS_MARK = {
     "DEPLOYED": "DEPLOYED",
     "SKIPPED": "SKIPPED",
     "UNKNOWN": "UNKNOWN (NOT_ESTABLISHED)",
+    "NOT_REPORTED": "NOT REPORTED",
+    "PARTIAL": "PARTIAL",
+    "READY": "READY",
+    "CONDITIONALLY_READY": "CONDITIONALLY READY",
+    "NOT_READY": "NOT READY",
+    "COMPLETED": "COMPLETED",
+    "COMPLETED_WITH_ERRORS": "COMPLETED WITH ERRORS",
+    "INCOMPLETE": "INCOMPLETE",
+    "COMPLETE": "COMPLETE",
+    "UNTRUSTWORTHY": "UNTRUSTWORTHY",
 }
+
+# Severity -> the action a reader should take, and how soon. Rendered in the
+# remediation plan so the plan is ordered by urgency rather than by scanner.
+REMEDIATION_TIERS = (
+    ("CRITICAL", "Immediate", "Remediate before this commit is deployed anywhere."),
+    ("HIGH", "High priority", "Remediate in this iteration."),
+    ("UNKNOWN", "High priority",
+     "Classify first. An unclassifiable finding is treated as HIGH here precisely because "
+     "nobody has yet established that it is not."),
+    ("MEDIUM", "Medium priority", "Schedule into the next planned iteration."),
+    ("LOW", "Long-term hardening", "Fold into routine maintenance."),
+    ("INFO", "Long-term hardening", "Informational; act on it where it is cheap to do so."),
+)
 
 
 def _mark(status: str) -> str:
@@ -59,13 +94,19 @@ def render_markdown(
     lines: List[str] = []
     add = lines.append
 
-    add("# Application Security Report")
+    readiness = report.get("readiness") or {}
+    pipeline = report.get("pipeline") or {}
+
+    add("# Application Security & Deployment Readiness Report")
     add("")
     add("_%s v%s -- Phase %s_"
         % (report["framework"]["name"], report["framework"]["version"], report["framework"]["active_phase"]))
     add("")
     add("Generated: `%s`" % report["generated_at"])
     add("")
+
+    _executive_summary(add, report, readiness, pipeline, status)
+    _management_view(add, report, readiness)
 
     # --- Two separate results -------------------------------------------------
     add("---")
@@ -718,7 +759,371 @@ def render_markdown(
     add("_A deployment result never implies a security result. This report asserts security only "
         "for the controls listed as PASS or FAILED above._")
     add("")
+
+    _readiness_section(add, readiness)
+    _decision_section(add, readiness)
+    _remediation_section(add, report)
+
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Executive and management sections
+# ---------------------------------------------------------------------------
+
+
+def _executive_summary(add, report, readiness, pipeline, status) -> None:
+    """Everything a decision-maker needs, before any section number."""
+    project = report["project"]
+    severities = report["findings"].get("security_severity_breakdown") or {}
+
+    add("---")
+    add("")
+    add("## EXECUTIVE SUMMARY")
+    add("")
+    add("| | |")
+    add("|---|---|")
+    add("| Project | %s |" % _escape(project["project_name"]))
+    add("| Branch | %s |" % _escape(project["branch"]))
+    add("| Commit | `%s` |" % _escape(project["commit"]))
+    add("| Environment | %s |" % _escape(project["environment"]))
+    add("| Framework version | %s |" % _escape(report["framework"]["version"]))
+    add("| Pipeline run | %s |" % _escape(project["run_url"]))
+    add("")
+    add("**The six results below are independent. None is derived from another.**")
+    add("")
+    add("| Result | Value | What it means |")
+    add("|---|---|---|")
+    add("| Pipeline execution | **%s** | Whether this framework finished its own job. |"
+        % _mark(pipeline.get("status", "INCOMPLETE")))
+    add("| Security validation | **%s** | Whether the security controls passed. |"
+        % _mark(status["security"]))
+    add("| Evidence | **%s** | Whether the evidence supports what is claimed. |"
+        % _mark(readiness.get("evidence_status", "UNTRUSTWORTHY")))
+    add("| Deployment readiness | **%s%%** | Of what was measured, how much passed. |"
+        % readiness.get("readiness_percent", 0.0))
+    add("| Assurance | **%s%%** | How much of the picture was measured at all. |"
+        % readiness.get("assurance_percent", 0.0))
+    add("| **Deployment decision** | **%s** | The recommendation. |"
+        % _mark(readiness.get("decision", "UNKNOWN")))
+    add("")
+    add("> **%s**" % _escape(readiness.get("statement", "")))
+    add("")
+    add("Open security findings: **%d CRITICAL, %d HIGH, %d MEDIUM, %d LOW, %d UNKNOWN**. "
+        "Every one is listed in this report. A finding does not stop this pipeline, and no "
+        "finding is removed, downgraded or suppressed in order to let it continue."
+        % (severities.get("CRITICAL", 0), severities.get("HIGH", 0), severities.get("MEDIUM", 0),
+           severities.get("LOW", 0), severities.get("UNKNOWN", 0)))
+    add("")
+
+
+def _management_view(add, report, readiness) -> None:
+    """The one section that is written for somebody who reads no other section."""
+    severities = report["findings"].get("security_severity_breakdown") or {}
+    blockers = readiness.get("blockers") or []
+    unknowns = readiness.get("unknowns") or []
+    conditions = readiness.get("conditions") or []
+    coverage = report.get("file_coverage") or {}
+    project = report["project"]
+
+    add("---")
+    add("")
+    add("## DEPLOYMENT READINESS SUMMARY")
+    add("")
+    add("| | |")
+    add("|---|---|")
+    add("| Application | **%s** |" % _escape(project["project_name"]))
+    add("| Readiness | **%s%%** |" % readiness.get("readiness_percent", 0.0))
+    add("| Assurance | **%s%%** |" % readiness.get("assurance_percent", 0.0))
+    add("| Status | **%s** |" % _mark(readiness.get("decision", "UNKNOWN")))
+    add("| Security | %d CRITICAL, %d HIGH, %d MEDIUM, %d LOW |"
+        % (severities.get("CRITICAL", 0), severities.get("HIGH", 0),
+           severities.get("MEDIUM", 0), severities.get("LOW", 0)))
+    add("| Test coverage | %s |" % _escape(project.get("test_coverage_reported", "NOT_ESTABLISHED")))
+    add("| Source analysed | %s |"
+        % ("%s%% of %s code files"
+           % (coverage.get("coverage_percent", 0.0), coverage.get("code_files", 0))
+           if coverage.get("available") else "NOT_ESTABLISHED"))
+    add("| Deployment permitted by this run | **%s** |"
+        % ("YES" if readiness.get("deployment_permitted") else "NO"))
+    add("")
+
+    if blockers:
+        add("**Main blockers**")
+        add("")
+        for index, blocker in enumerate(blockers, 1):
+            add("%d. **%s** -- %s" % (index, _escape(blocker["title"]), _escape(blocker["reason"])))
+        add("")
+    else:
+        add("**No blocker.** Nothing in this run's evidence prevents deployment outright.")
+        add("")
+
+    if unknowns:
+        add("**Not established -- these are NOT passes**")
+        add("")
+        for unknown in unknowns:
+            add("- **%s** is `%s`" % (_escape(unknown["title"]), unknown["state"]))
+        add("")
+
+    add("**Recommended action**")
+    add("")
+    add(_recommended_action(readiness, blockers, conditions, unknowns, severities))
+    add("")
+
+
+def _recommended_action(readiness, blockers, conditions, unknowns, severities) -> str:
+    """One sentence naming the next thing to do, derived from the decision."""
+    decision = readiness.get("decision", "UNKNOWN")
+    if decision == "NOT_READY":
+        return (
+            "Resolve the %d blocker(s) above, then rerun validation. Deployment is not "
+            "authorised by this run. If a blocker is an accepted risk, record it in the "
+            "exceptions file with an owner and an expiry date -- that is the only mechanism "
+            "this framework recognises for accepting risk, and an undated exception does not "
+            "suppress anything." % len(blockers)
+        )
+    if decision == "UNKNOWN":
+        return (
+            "Do not deploy on the strength of this run. Readiness could not be established: "
+            "%d dimension(s) were not measured and the evidence does not support a decision "
+            "either way. Fix the validation gaps listed above and rerun." % len(unknowns)
+        )
+    if decision == "CONDITIONALLY_READY":
+        parts = []
+        if severities.get("CRITICAL", 0) or severities.get("HIGH", 0):
+            parts.append(
+                "remediate the %d CRITICAL and %d HIGH finding(s)"
+                % (severities.get("CRITICAL", 0), severities.get("HIGH", 0))
+            )
+        if unknowns:
+            parts.append("close the %d unmeasured dimension(s)" % len(unknowns))
+        if conditions:
+            parts.append("clear the %d outstanding condition(s)" % len(conditions))
+        return (
+            "Nothing blocks deployment, but this is not a clean bill of health: %s. Whether to "
+            "ship now is a decision a person makes with the conditions above in front of them; "
+            "this report does not make it for them."
+            % ("; ".join(parts) if parts else "review the conditions above")
+        )
+    return (
+        "No action is required by this run's evidence before deployment. Note that the manual "
+        "control areas listed later in this report remain untested by any automation, and this "
+        "report makes no claim about them."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Readiness detail
+# ---------------------------------------------------------------------------
+
+
+def _readiness_section(add, readiness) -> None:
+    calculation = readiness.get("calculation") or {}
+    dimensions = readiness.get("dimensions") or []
+
+    add("---")
+    add("")
+    add("## 15. Deployment Readiness")
+    add("")
+    if not dimensions:
+        add("Deployment readiness was not assessed for this run.")
+        add("")
+        add("> %s" % _escape(readiness.get("statement", "")))
+        add("")
+        return
+
+    add("**Readiness %s%% -- assurance %s%%**"
+        % (readiness.get("readiness_percent", 0.0), readiness.get("assurance_percent", 0.0)))
+    add("")
+    add("### 15.1 How these numbers were calculated")
+    add("")
+    add("```")
+    add("readiness = %s" % calculation.get("formula_readiness", ""))
+    add("assurance = %s" % calculation.get("formula_assurance", ""))
+    add("```")
+    add("")
+    add("| Term | Value |")
+    add("|---|---|")
+    add("| Dimensions measured | %s |" % calculation.get("measured_dimensions", 0))
+    add("| Dimensions not established (UNKNOWN) | %s |" % calculation.get("unknown_dimensions", 0))
+    add("| Dimensions not applicable (excluded) | %s |" % calculation.get("excluded_dimensions", 0))
+    add("| Weight measured | %s |" % calculation.get("measured_weight", 0))
+    add("| Weight earned | %s |" % calculation.get("earned_weight", 0))
+    add("| Weight unknown | %s |" % calculation.get("unknown_weight", 0))
+    add("| Weight excluded | %s |" % calculation.get("excluded_weight", 0))
+    add("| **Readiness** | **%s%%** |" % calculation.get("readiness_percent", 0.0))
+    add("| **Assurance** | **%s%%** |" % calculation.get("assurance_percent", 0.0))
+    add("")
+    thresholds = calculation.get("thresholds") or {}
+    add("Policy thresholds in force for this run: READY requires readiness >= `%s%%` and "
+        "assurance >= `%s%%`; below `%s%%` assurance the decision is UNKNOWN rather than "
+        "conditional; CONDITIONALLY_READY %s authorise deployment on its own."
+        % (thresholds.get("ready_at_or_above_percent", "?"),
+           thresholds.get("minimum_assurance_percent", "?"),
+           thresholds.get("unknown_below_assurance_percent", "?"),
+           "DOES" if thresholds.get("conditionally_ready_permits_deployment") else "does NOT"))
+    add("")
+    add("> %s" % _escape(calculation.get("note", "")))
+    add("")
+
+    add("### 15.2 Every dimension, with the evidence behind it")
+    add("")
+    add("| Dimension | Family | State | Weight | Score | Earned | Counts |")
+    add("|---|---|---|---|---|---|---|")
+    for dimension in dimensions:
+        if dimension["counts_toward_score"]:
+            counts = "score"
+        elif dimension["counts_toward_unknown"]:
+            counts = "unknown"
+        else:
+            counts = "excluded"
+        add("| %s | %s | %s | %s | %s | %s | %s |" % (
+            _escape(dimension["title"]),
+            dimension["family"],
+            _mark(dimension["state"]),
+            dimension["weight"],
+            "--" if dimension["score"] is None else round(dimension["score"], 3),
+            "--" if dimension["earned"] is None else dimension["earned"],
+            counts,
+        ))
+    add("")
+    add("`score` is absent rather than zero wherever a dimension was not measured. Those two "
+        "are different facts and this table never renders them the same way.")
+    add("")
+
+    add("### 15.3 Strengths")
+    add("")
+    strengths = readiness.get("strengths") or []
+    if strengths:
+        for strength in strengths:
+            add("- %s" % _escape(strength))
+    else:
+        add("No readiness dimension passed cleanly in this run.")
+    add("")
+
+    add("### 15.4 Weaknesses and outstanding conditions")
+    add("")
+    conditions = readiness.get("conditions") or []
+    if conditions:
+        for condition in conditions:
+            add("- **%s** (`%s`): %s"
+                % (_escape(condition["title"]), condition["state"], _escape(condition["detail"])))
+    else:
+        add("No outstanding condition.")
+    add("")
+
+    add("### 15.5 Blockers")
+    add("")
+    blockers = readiness.get("blockers") or []
+    if blockers:
+        for blocker in blockers:
+            add("- **%s**: %s" % (_escape(blocker["title"]), _escape(blocker["reason"])))
+    else:
+        add("No blocking condition.")
+    add("")
+
+    add("### 15.6 Unknowns -- what this run did NOT establish")
+    add("")
+    unknowns = readiness.get("unknowns") or []
+    if unknowns:
+        add("| Dimension | State | Why |")
+        add("|---|---|---|")
+        for unknown in unknowns:
+            add("| %s | %s | %s |"
+                % (_escape(unknown["title"]), _mark(unknown["state"]),
+                   _truncate(unknown["detail"], 200)))
+        add("")
+        add("**None of the above is a pass.** Each one lowers assurance and none of them "
+            "contributes to the readiness percentage.")
+    else:
+        add("Every readiness dimension in scope was established in this run.")
+    add("")
+
+    problems = readiness.get("integrity_problems") or []
+    if problems:
+        add("### 15.7 Evidence integrity problems")
+        add("")
+        for problem in problems:
+            add("- %s" % _escape(problem))
+        add("")
+
+
+def _decision_section(add, readiness) -> None:
+    add("---")
+    add("")
+    add("## 16. Deployment Decision")
+    add("")
+    add("# %s" % _mark(readiness.get("decision", "UNKNOWN")))
+    add("")
+    add("| | |")
+    add("|---|---|")
+    add("| Deployment permitted by this run | **%s** |"
+        % ("YES" if readiness.get("deployment_permitted") else "NO"))
+    add("| Readiness | %s%% |" % readiness.get("readiness_percent", 0.0))
+    add("| Assurance | %s%% |" % readiness.get("assurance_percent", 0.0))
+    add("| Evidence | %s |" % _mark(readiness.get("evidence_status", "UNTRUSTWORTHY")))
+    add("")
+    add("**Why:**")
+    add("")
+    for reason in readiness.get("decision_rationale") or []:
+        add("- %s" % _escape(reason))
+    add("")
+    add("> %s" % _escape(readiness.get("independence_note", "")))
+    add("")
+
+
+# ---------------------------------------------------------------------------
+# Remediation plan
+# ---------------------------------------------------------------------------
+
+
+def _remediation_section(add, report) -> None:
+    """Findings reordered by what to do about them, not by which tool found them."""
+    items = [f for f in (report["findings"].get("items") or []) if f.get("status") in
+             ("OPEN", "CONFIRMED", "REOPENED", "TO_REVIEW")]
+
+    add("---")
+    add("")
+    add("## 17. Remediation Plan")
+    add("")
+    if not items:
+        add("No open finding requires remediation in this run.")
+        add("")
+        add("_This is a statement about what was looked for and found. Consult the coverage "
+            "census and the manual control list for what was not looked for at all._")
+        add("")
+        return
+
+    by_severity: Dict[str, List[Dict[str, Any]]] = {}
+    for finding in items:
+        by_severity.setdefault(finding.get("severity", "UNKNOWN"), []).append(finding)
+
+    for severity, tier, guidance in REMEDIATION_TIERS:
+        bucket = by_severity.get(severity) or []
+        if not bucket:
+            continue
+        add("### %s -- %d %s finding(s)" % (tier, len(bucket), severity))
+        add("")
+        add("_%s_" % guidance)
+        add("")
+        # Group by remediation advice so the plan reads as work items rather
+        # than as a repeat of the findings table.
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for finding in bucket:
+            key = _truncate(finding.get("remediation") or "No remediation guidance was supplied "
+                            "by the scanner that reported this.", 220)
+            grouped.setdefault(key, []).append(finding)
+        add("| Action | Findings | Where | Reported by |")
+        add("|---|---|---|---|")
+        for action, group in sorted(grouped.items(), key=lambda kv: -len(kv[1])):
+            files = sorted({f.get("file") or f.get("endpoint") or "n/a" for f in group})
+            tools = sorted({f.get("tool", "") for f in group})
+            where = ", ".join(files[:3])
+            if len(files) > 3:
+                where += " and %d more" % (len(files) - 3)
+            add("| %s | %d | %s | %s |"
+                % (action, len(group), _escape(where), _escape(", ".join(tools))))
+        add("")
 
 
 def write_markdown(
