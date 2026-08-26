@@ -333,6 +333,16 @@ class SemgrepCollector(Collector):
         result.metadata["blocking_error_count"] = len(blocking)
         result.metadata["unparsed_files"] = sorted(unparsed)
 
+        # Hand the unparsed paths to the file-level census. Without this the
+        # census credited a file the engine explicitly said it could NOT read:
+        # `reads()` decided on completed + extension + exclusions only, so a
+        # parse failure was invisible to it and the published coverage figure
+        # over-claimed. That is the precise failure this framework exists to
+        # prevent, and the TNCWWB gate caught it as a caveat (Core.php).
+        declared_coverage = result.metadata.get("coverage")
+        if isinstance(declared_coverage, dict):
+            declared_coverage["unparsed_files"] = sorted(unparsed)
+
         if blocking:
             # A rule failed to run or the engine errored. Coverage is unknown, so
             # the category must not be verified on this result.

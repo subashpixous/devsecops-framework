@@ -237,3 +237,86 @@ class FailClosedTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- Files the engine could not parse ----------------------------------------
+#
+# TNCWWB run 32929294329 exposed a coverage over-claim: Semgrep reported it could
+# not parse Core.php, yet the census still counted that file as `analysed`.
+# `reads()` decided on completed + extension + exclusions only, so a per-file
+# parse failure was invisible to it and the published coverage figure overstated
+# what the engine had actually read. The gate caught it as a caveat; the census
+# should never have produced the wrong number.
+
+
+class EngineCouldNotParse(unittest.TestCase):
+    def _manifest(self, unparsed):
+        workspace = tempfile.mkdtemp()
+        for name in ("Core.php", "index.php"):
+            with open(os.path.join(workspace, name), "w", encoding="utf-8") as handle:
+                handle.write("<?php\n")
+        result = ScannerResult(tool="semgrep", category_key="sast_semgrep")
+        result.metadata["coverage"] = {
+            "exclusions": {"intent": "sast", "patterns": []},
+            "extensions": [".php"],
+            "unparsed_files": list(unparsed),
+        }
+        result.payload = {}
+        result.succeed()
+        return build_manifest(workspace, [result], ["php"])
+
+    def test_an_unparseable_file_is_not_counted_as_analysed(self):
+        """The exact TNCWWB defect."""
+        manifest = self._manifest(["Core.php"])
+        self.assertEqual(manifest["code_files"], 2)
+        self.assertEqual(
+            manifest["code_files_analysed"], 1,
+            "a file the engine could not parse must not be credited as analysed",
+        )
+        self.assertEqual(manifest["code_files_not_analysed"], 1)
+        self.assertFalse(manifest["complete"])
+
+    def test_it_lands_in_its_own_bucket_with_a_named_reason(self):
+        manifest = self._manifest(["Core.php"])
+        self.assertEqual(manifest["counts"]["engine_could_not_parse"], 1)
+        entry = manifest["not_analysed"]["engine_could_not_parse"]["files"][0]
+        self.assertEqual(entry["file"], "Core.php")
+        self.assertIn("could not parse", entry["reason"])
+        self.assertIn("semgrep", entry["reason"])
+
+    def test_the_statement_names_the_parse_failure(self):
+        self.assertIn(
+            "could not parse them", self._manifest(["Core.php"])["statement"]
+        )
+
+    def test_a_basename_report_matches_a_nested_path(self):
+        """Engines report a basename or a relative path depending on invocation."""
+        workspace = tempfile.mkdtemp()
+        nested = os.path.join(workspace, "src", "lib")
+        os.makedirs(nested)
+        with open(os.path.join(nested, "Core.php"), "w", encoding="utf-8") as handle:
+            handle.write("<?php\n")
+        result = ScannerResult(tool="semgrep", category_key="sast_semgrep")
+        result.metadata["coverage"] = {
+            "exclusions": {"intent": "sast", "patterns": []},
+            "extensions": [".php"],
+            "unparsed_files": ["Core.php"],
+        }
+        result.payload = {}
+        result.succeed()
+        manifest = build_manifest(workspace, [result], ["php"])
+        self.assertEqual(manifest["code_files_analysed"], 0)
+        self.assertEqual(manifest["counts"]["engine_could_not_parse"], 1)
+
+    def test_no_parse_failures_leaves_coverage_unchanged(self):
+        manifest = self._manifest([])
+        self.assertEqual(manifest["code_files_analysed"], 2)
+        self.assertEqual(manifest["counts"]["engine_could_not_parse"], 0)
+        self.assertTrue(manifest["complete"])
+
+    def test_parse_failure_is_distinct_from_having_no_engine(self):
+        """`engine_could_not_parse` must not be conflated with either neighbour."""
+        manifest = self._manifest(["Core.php"])
+        self.assertEqual(manifest["counts"]["no_scanner_for_filetype"], 0)
+        self.assertEqual(manifest["counts"]["scanner_did_not_complete"], 0)
+        self.assertEqual(manifest["counts"]["engine_could_not_parse"], 1)

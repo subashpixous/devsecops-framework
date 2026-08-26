@@ -12,6 +12,7 @@ in exactly one bucket, and every bucket other than `analysed` names its reason:
     excluded_path             matched a declared exclusion (the pattern is named)
     no_scanner_for_filetype   the framework has no engine that parses this type
     scanner_did_not_complete  the engine that would have read it failed or was absent
+    engine_could_not_parse    the engine READ it and could not parse it
     not_code                  images, fonts, archives, media -- data, not source
 
 `not_code` is a real bucket rather than a silent drop: a repository whose only
@@ -78,10 +79,16 @@ BUCKET_EXCLUDED = "excluded_path"
 BUCKET_NO_ENGINE = "no_scanner_for_filetype"
 BUCKET_SCANNER_FAILED = "scanner_did_not_complete"
 BUCKET_NOT_CODE = "not_code"
+# The engine READ this file and could not parse it. Distinct from
+# `no_scanner_for_filetype` (we never had an engine for it) and from
+# `scanner_did_not_complete` (the whole scan failed). Here the scan succeeded
+# and this one file was not understood -- so it was not analysed, and saying
+# otherwise overstates coverage.
+BUCKET_UNPARSEABLE = "engine_could_not_parse"
 
 BUCKETS = (
     BUCKET_ANALYSED, BUCKET_EXCLUDED, BUCKET_NO_ENGINE,
-    BUCKET_SCANNER_FAILED, BUCKET_NOT_CODE,
+    BUCKET_SCANNER_FAILED, BUCKET_UNPARSEABLE, BUCKET_NOT_CODE,
 )
 
 
@@ -139,9 +146,25 @@ class ScanCoverage:
     # analysis covered beats any inference from extensions and patterns, so when
     # this is present it decides `reads()` on its own.
     explicit_files: Optional[frozenset] = None
+    # Paths this engine reported it could not parse. Matched on both the
+    # relative path and the basename, because engines report one or the other
+    # depending on how the target was passed to them.
+    unparsed_files: frozenset = frozenset()
+
+    def could_not_parse(self, relative_path: str) -> bool:
+        if not self.unparsed_files:
+            return False
+        return (
+            relative_path in self.unparsed_files
+            or os.path.basename(relative_path) in self.unparsed_files
+        )
 
     def reads(self, relative_path: str, extension: str) -> bool:
         if not self.completed:
+            return False
+        # A file the engine could not parse was NOT analysed, however complete
+        # the rest of the scan was.
+        if self.could_not_parse(relative_path):
             return False
         if self.explicit_files is not None:
             return relative_path in self.explicit_files
@@ -258,6 +281,9 @@ def scan_coverage_from_results(scanner_results: Sequence[Any]) -> List[ScanCover
                 status_reason=reason,
                 unit=str(declared.get("unit") or "files"),
                 unit_detail=dict(declared.get("unit_detail") or {}),
+                unparsed_files=frozenset(
+                    str(p).replace("\\", "/") for p in (declared.get("unparsed_files") or ())
+                ),
                 explicit_files=(
                     frozenset(str(p).replace("\\", "/") for p in declared["files"])
                     if isinstance(declared.get("files"), (list, tuple, set))
@@ -360,7 +386,18 @@ def _build_manifest(
             covered_by[relative] = readers
             continue
 
-        if extension in NOT_CODE_EXTENSIONS:
+        # Checked BEFORE the type/exclusion checks: an engine that read the file
+        # and could not parse it is a more specific fact than "no engine for this
+        # type", and it is the reason that must be reported.
+        unparsed_by = sorted({c.tool for c in coverages if c.could_not_parse(relative)})
+        if unparsed_by:
+            bucket = BUCKET_UNPARSEABLE
+            reasons.setdefault(
+                relative,
+                "%s read this file and could not parse it, so it was NOT analysed"
+                % ", ".join(unparsed_by),
+            )
+        elif extension in NOT_CODE_EXTENSIONS:
             bucket = BUCKET_NOT_CODE
         elif any(is_excluded(relative, c.patterns) for c in coverages if c.patterns):
             bucket = BUCKET_EXCLUDED
@@ -612,7 +649,7 @@ def _named_sample(
 ) -> Dict[str, Any]:
     """Bounded, per-bucket listing of files that were not analysed."""
     out: Dict[str, Any] = {}
-    for bucket in (BUCKET_SCANNER_FAILED, BUCKET_EXCLUDED, BUCKET_NO_ENGINE):
+    for bucket in (BUCKET_SCANNER_FAILED, BUCKET_UNPARSEABLE, BUCKET_EXCLUDED, BUCKET_NO_ENGINE):
         paths = buckets[bucket]
         if not paths:
             continue
@@ -658,6 +695,11 @@ def _statement(total: int, analysed: int, unanalysed: int, counts: Dict[str, int
         parts.append(
             "%d because the engine that reads them did not complete"
             % counts[BUCKET_SCANNER_FAILED]
+        )
+    if counts.get(BUCKET_UNPARSEABLE):
+        parts.append(
+            "%d because the engine read them and could not parse them"
+            % counts[BUCKET_UNPARSEABLE]
         )
     if counts.get(BUCKET_EXCLUDED):
         parts.append("%d by a declared path exclusion" % counts[BUCKET_EXCLUDED])
